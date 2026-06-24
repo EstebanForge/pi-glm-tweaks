@@ -37,6 +37,7 @@ This extension collapses that mismatch:
    ```
 2. **Auto-clamps on `model_select`** — if the current level is one we hid (e.g. you switched from a model that allowed `medium`), quietly bump to `high` and notify.
 3. **Footer hint** — sets `ctx.ui.setStatus("glm-thinking", "thinking: off | high | max")` while GLM-5.2 is the active model.
+4. **`/glm-tweaks` command** — status panel + flag toggle from inside Pi (see [`/glm-tweaks` command](#glm-tweaks-command)).
 
 `Shift+Tab`, `/thinking`, and the level picker all see only the three GLM-5.2 modes.
 
@@ -51,6 +52,21 @@ GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reaso
 | `glm-quick-disable` | `true` | For user prompts under 80 chars, forces `thinking.type: "disabled"` for that turn. Trivial questions ("what time is it") don't need deep thinking. |
 
 All three flags surface in `pi config` and Pi's flag editor — `pi config set glm-budget-nudge false` to disable.
+
+## `/glm-tweaks` command
+
+An in-session command for inspecting and flipping the flags above without leaving Pi.
+
+| Invocation | Effect |
+| --- | --- |
+| `/glm-tweaks` (TUI) | Opens an interactive settings menu (the same `SettingsList` component `/settings` uses). Flip any combination of flags, then a single reload fires on close to apply them all. |
+| `/glm-tweaks` (non-TUI / RPC) | Falls back to a read-only status panel (active model, thinking level vs the `off \| high \| max` map, and each flag's on/off state). |
+| `/glm-tweaks toggle <flag>` | One-shot flip: persists, then reloads. |
+| `/glm-tweaks <flag>` | Shorthand one-shot toggle (flag name without the `toggle` keyword). |
+
+The command offers tab-completion for `toggle` and the three flag names.
+
+**Why a reload per apply.** Pi's extension API exposes `getFlag` but no live `setFlag`, and flag values are read into memory at load time. So changes persist via `pi config set` and a `/reload` picks them up. The interactive menu stages all your flips and reloads once on close; the one-shot toggle reloads immediately. In both cases the command notifies (`Applied 2 change(s). Reloading...`) before reloading. If you'd rather avoid reload churn entirely, set flags directly in `pi config` / the flag editor and reload once at your convenience.
 
 ### What the tweaks cannot do
 

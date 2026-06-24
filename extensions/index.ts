@@ -41,7 +41,8 @@
  * Auth is untouched. The provider's existing key (ZAI_API_KEY env, /login,
  * or models.json apiKey) continues to resolve against the new baseUrl.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
 
 const PROVIDER = "zai";
 const MODEL_ID = "glm-5.2";
@@ -58,6 +59,29 @@ const HIDDEN_LEVELS = new Set(["minimal", "low", "medium"]);
 // eagerly enough.
 const SHORT_PROMPT_THRESHOLD = 80;
 const RATCHET_THRESHOLD_CHARS = 2_000;
+
+// Token-efficiency flags. Single source of truth — drives registerFlag,
+// the /glm-tweaks status display, autocomplete, and the toggle subcommand.
+// All default on. See README for what each does at the wire level.
+const FLAGS = [
+	{
+		name: "glm-budget-nudge",
+		label: "Budget nudge",
+		description:
+			"Inject a soft thinking-budget system-prompt fragment and intra-loop ratchet for zai/glm-5.2.",
+	},
+	{
+		name: "glm-clear-thinking",
+		label: "Clear thinking",
+		description:
+			"Force clear_thinking=true on zai/glm-5.2 requests to prevent cross-turn reasoning_content carryover on the coding endpoint.",
+	},
+	{
+		name: "glm-quick-disable",
+		label: "Quick disable",
+		description: "Disable thinking on short user prompts (<80 chars) to save tokens on trivial turns.",
+	},
+] as const;
 
 // Soft system-prompt fragment appended to every zai/glm-5.2 turn when
 // the budget-nudge flag is on. No "I'm overthinking" ack string — that's
@@ -108,24 +132,172 @@ function isZaiGlm52(model: { provider: string; id: string } | undefined | null):
 	return !!model && model.provider === PROVIDER && model.id === MODEL_ID;
 }
 
+// Build the /glm-tweaks status panel. Read-only snapshot of the active
+// model, current thinking level, and the on/off state of every flag.
+function renderStatus(
+	pi: ExtensionAPI,
+	model: { provider: string; id: string } | undefined,
+): string {
+	const active = isZaiGlm52(model);
+	const level = pi.getThinkingLevel();
+	const flagLines = FLAGS.map((f) => `  ${pi.getFlag(f.name) === true ? "[x]" : "[ ]"} ${f.name}`);
+	return [
+		`GLM-5.2 tweaks — ${active ? "ACTIVE (zai/glm-5.2 selected)" : "inactive (select zai/glm-5.2 to engage)"}`,
+		`thinking: ${active ? `current=${level}, wire=off|high|max` : "n/a"}`,
+		"",
+		"flags:",
+		...flagLines,
+		"",
+		"toggle: /glm-tweaks toggle <flag>   (shorthand: /glm-tweaks <flag>)",
+		"also:   pi config set <flag> false",
+	].join("\n");
+}
+
 export default function (pi: ExtensionAPI) {
 	// Register Pi-idiomatic flags at factory load time, NOT inside
 	// session_start. registerFlag is static setup; calling it per session
 	// would clobber user preferences on every /new or /reload.
-	pi.registerFlag("glm-budget-nudge", {
-		description: "Inject a soft thinking-budget system-prompt fragment and intra-loop ratchet for zai/glm-5.2.",
-		type: "boolean",
-		default: true,
-	});
-	pi.registerFlag("glm-clear-thinking", {
-		description: "Force clear_thinking=true on zai/glm-5.2 requests to prevent cross-turn reasoning_content carryover on the coding endpoint.",
-		type: "boolean",
-		default: true,
-	});
-	pi.registerFlag("glm-quick-disable", {
-		description: "Disable thinking on short user prompts (<80 chars) to save tokens on trivial turns.",
-		type: "boolean",
-		default: true,
+	for (const f of FLAGS) {
+		pi.registerFlag(f.name, { description: f.description, type: "boolean", default: true });
+	}
+
+	// /glm-tweaks — status display by default; `toggle <flag>` (or bare
+	// `<flag>`) flips a boolean. ExtensionAPI exposes no live setFlag, so a
+	// toggle persists via `pi config set` and then reloads the session so
+	// the in-memory flag value picks up the change. ctx is stale after
+	// reload() — we notify first, reload last, and return immediately.
+	pi.registerCommand("glm-tweaks", {
+		description: "GLM-5.2 tweaks: show status, or toggle a flag. Usage: /glm-tweaks [toggle <flag>]",
+		getArgumentCompletions: (prefix: string) => {
+			// Preserve trailing space: `/glm-tweaks toggle ` (with space) means
+			// the `toggle` token is complete and we should now suggest flags.
+			// Trimming would collapse it to "toggle" and re-suggest the word.
+			const trailingSpace = /\s$/.test(prefix);
+			const tokens = prefix.trim().split(/\s+/).filter(Boolean);
+			const flagNames = FLAGS.map((f) => f.name);
+			const root = ["toggle", ...flagNames];
+			// Suggest flag names once `toggle` is complete (either as the only
+			// token with a trailing space, or with a partial flag typed).
+			const toggleComplete =
+				(tokens.length === 1 && tokens[0] === "toggle") ||
+				(tokens.length >= 2 && tokens[0] === "toggle");
+			if (toggleComplete) {
+				const partial = tokens.length >= 2 ? tokens[tokens.length - 1] : "";
+				const hits = flagNames.filter((n) => n.startsWith(partial));
+				return hits.length ? hits.map((v) => ({ value: v, label: v })) : null;
+			}
+			if (tokens.length <= 1 && !trailingSpace) {
+				const hits = root.filter((o) => o.startsWith(tokens[0] ?? ""));
+				return hits.length ? hits.map((v) => ({ value: v, label: v })) : null;
+			}
+			return null;
+		},
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+
+			// Toggle mode: `/glm-tweaks toggle <flag>` or `/glm-tweaks <flag>`.
+			// Direct one-shot flip — persists via `pi config set` then reloads.
+			// Bare `/glm-tweaks toggle` (no flag) falls through to the menu.
+			if (trimmed !== "" && trimmed !== "status" && trimmed !== "toggle") {
+				const tokens = trimmed.split(/\s+/).filter(Boolean);
+				const flagName = tokens[0] === "toggle" ? tokens[1] : tokens[0];
+				const meta = FLAGS.find((f) => f.name === flagName);
+				if (!meta) {
+					ctx.ui.notify(
+						`Unknown flag "${flagName}". Valid: ${FLAGS.map((f) => f.name).join(", ")}`,
+						"warning",
+					);
+					return;
+				}
+				const current = pi.getFlag(meta.name) === true;
+				const next = !current;
+				const result = await pi.exec("pi", ["config", "set", meta.name, String(next)]);
+				if (result.code !== 0) {
+					ctx.ui.notify(
+						`Failed to set ${meta.name}: ${result.stderr.trim() || `exit ${result.code}`}`,
+						"error",
+					);
+					return;
+				}
+				ctx.ui.notify(`${meta.name}: ${current} → ${next}. Reloading...`, "info");
+				await ctx.reload();
+				return;
+			}
+
+			// Status/menu mode. In TUI, open an interactive SettingsList
+			// (same component /settings uses) so the user can flip several
+			// flags in one visit; changes persist via `pi config set` and a
+			// single reload fires on close. Outside TUI (RPC/headless), fall
+			// back to the read-only status panel — custom components are
+			// terminal-only.
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify(renderStatus(pi, ctx.model), "info");
+				return;
+			}
+
+			const active = isZaiGlm52(ctx.model);
+			const pending = new Map<string, boolean>();
+			const items: SettingItem[] = FLAGS.map((f) => ({
+				id: f.name,
+				label: f.label,
+				currentValue: pi.getFlag(f.name) === true ? "on" : "off",
+				values: ["on", "off"],
+			}));
+
+			await ctx.ui.custom((tui, theme, _kb, done) => {
+				const container = new Container();
+				const header = active
+					? "GLM-5.2 tweaks — zai/glm-5.2 active"
+					: "GLM-5.2 tweaks — inactive (select zai/glm-5.2 to engage)";
+				container.addChild(new Text(theme.fg("accent", theme.bold(header)), 1, 1));
+
+				const settingsList = new SettingsList(
+					items,
+					Math.min(items.length + 2, 15),
+					getSettingsListTheme(),
+					(id, newValue) => {
+						// Stage the change; persist + reload on close, not here,
+						// so the user can flip several flags per visit.
+						pending.set(id, newValue === "on");
+					},
+					() => done(undefined),
+				);
+				container.addChild(settingsList);
+
+				return {
+					render: (w: number) => container.render(w),
+					invalidate: () => container.invalidate(),
+					handleInput: (data: string) => {
+						settingsList.handleInput?.(data);
+						tui.requestRender();
+					},
+				};
+			});
+
+			// Dialog closed. ctx is still valid here (reload is the only
+			// staleness trigger, and we haven't called it yet). Drop net-zero
+			// flips (a flag toggled on then off stages but changes nothing),
+			// then persist genuine deltas and reload once if any moved.
+			const deltas: Array<[string, boolean]> = [];
+			for (const [name, val] of pending) {
+				const currentlyOn = pi.getFlag(name) === true;
+				if (currentlyOn === val) continue; // net-zero: toggled back to current
+				deltas.push([name, val]);
+			}
+			if (deltas.length === 0) return;
+
+			const failures: string[] = [];
+			for (const [name, val] of deltas) {
+				const r = await pi.exec("pi", ["config", "set", name, String(val)]);
+				if (r.code !== 0) failures.push(`${name} (${r.stderr.trim() || `exit ${r.code}`})`);
+			}
+			if (failures.length > 0) {
+				ctx.ui.notify(`Failed to apply: ${failures.join("; ")}`, "error");
+				return;
+			}
+			ctx.ui.notify(`Applied ${deltas.length} change(s). Reloading...`, "info");
+			await ctx.reload();
+		},
 	});
 
 	// Per-loop mutable state. Node.js runs the extension hooks single-
@@ -196,13 +368,17 @@ export default function (pi: ExtensionAPI) {
 		if (pi.getFlag("glm-budget-nudge") !== true) return {};
 		if (loop.ratchetFired) return {};
 
-		// Sum reasoning_content from assistant messages in the CURRENT
-		// agent loop only. Find the boundary by walking back to the last
-		// `role: "user"` message (the prompt that started this loop).
-		// toolResult / assistant / custom / etc. are not user role, so
-		// they don't reset the boundary. Without this scoping, a long
-		// session would fire the ratchet on the first LLM call of every
-		// new turn regardless of current-loop thinking.
+		// Sum reasoning from assistant messages in the CURRENT agent loop
+		// only. Find the boundary by walking back to the last `role: "user"`
+		// message (the prompt that started this loop). toolResult / assistant
+		// / custom / etc. are not user role, so they don't reset the boundary.
+		// Without this scoping, a long session would fire the ratchet on the
+		// first LLM call of every new turn regardless of current-loop thinking.
+		//
+		// Pi stores assistant thinking in content[] as ThinkingContent blocks
+		// ({type:"thinking", thinking:string}) — NOT a top-level
+		// `reasoning_content` field (that's the Z.AI wire name). Reading the
+		// wrong field was a 1.0.0 bug that left the ratchet permanently dead.
 		let loopStart = event.messages.length - 1;
 		while (loopStart > 0) {
 			const m = event.messages[loopStart] as { role?: string } | undefined;
@@ -214,10 +390,17 @@ export default function (pi: ExtensionAPI) {
 		for (let i = loopStart + 1; i < event.messages.length; i++) {
 			const m = event.messages[i];
 			if (typeof m !== "object" || m === null) continue;
-			const msg = m as { role?: string; reasoning_content?: unknown };
-			if (msg.role !== "assistant") continue;
-			if (typeof msg.reasoning_content === "string") {
-				totalReasoning += msg.reasoning_content.length;
+			const msg = m as { role?: string; content?: unknown };
+			if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+			for (const block of msg.content) {
+				if (
+					block &&
+					typeof block === "object" &&
+					(block as { type?: string }).type === "thinking" &&
+					typeof (block as { thinking?: unknown }).thinking === "string"
+				) {
+					totalReasoning += (block as { thinking: string }).thinking.length;
+				}
 			}
 		}
 		if (totalReasoning < RATCHET_THRESHOLD_CHARS) return {};
@@ -227,6 +410,7 @@ export default function (pi: ExtensionAPI) {
 			role: "user",
 			content:
 				"[system reminder: you've been thinking extensively without taking a tool call. Take a tool call now or wrap up your response.]",
+			timestamp: Date.now(),
 		};
 		return { messages: [...event.messages, hint as never] };
 	});
@@ -256,6 +440,11 @@ export default function (pi: ExtensionAPI) {
 		// Short-prompt quick-disable: trivial turns ("what time is it")
 		// don't need deep thinking. Force the kill switch and let Pi's
 		// zai branch drop the thinking.type="disabled" through.
+		//
+		// Intentionally applies to every LLM call in the loop, not just the
+		// first: loop.shortPrompt is computed once from the initial prompt
+		// and held constant (see before_agent_start). A short prompt that
+		// spawns tool calls stays thinking-free for the whole turn.
 		if (pi.getFlag("glm-quick-disable") === true && loop.shortPrompt) {
 			thinking.type = "disabled";
 			mutated = true;
