@@ -5,7 +5,7 @@
  * supports (off, high, max), wires the native `thinkingFormat: "zai"` wire
  * translation, auto-clamps hidden levels, and applies token-efficiency
  * hygiene (per-turn system-prompt nudge, intra-loop ratchet, wire-level
- * clear_thinking and short-prompt quick-disable).
+ * clear_thinking and skip-short-thinking).
  *
  * Wire map (see https://docs.z.ai/guides/capabilities/thinking and
  * providers/openai-completions.js in pi-ai):
@@ -36,7 +36,7 @@
  *     endpoint defaults to preserved thinking, which silently compounds
  *     `reasoning_content` across turns). `glm-clear-thinking`, default on.
  *   - On short user prompts (<80 chars), force `thinking.type: "disabled"`
- *     to save tokens on trivial turns. `glm-quick-disable`, default on.
+ *     to save tokens on trivial turns. `glm-skip-short-thinking`, default on.
  *
  * Auth is untouched. The provider's existing key (ZAI_API_KEY env, /login,
  * or models.json apiKey) continues to resolve against the new baseUrl.
@@ -77,8 +77,8 @@ const FLAGS = [
 			"Force clear_thinking=true on zai/glm-5.2 requests to prevent cross-turn reasoning_content carryover on the coding endpoint.",
 	},
 	{
-		name: "glm-quick-disable",
-		label: "Quick disable",
+		name: "glm-skip-short-thinking",
+		label: "Skip short thinking",
 		description: "Disable thinking on short user prompts (<80 chars) to save tokens on trivial turns.",
 	},
 ] as const;
@@ -240,6 +240,7 @@ export default function (pi: ExtensionAPI) {
 			const items: SettingItem[] = FLAGS.map((f) => ({
 				id: f.name,
 				label: f.label,
+				description: f.description,
 				currentValue: pi.getFlag(f.name) === true ? "on" : "off",
 				values: ["on", "off"],
 			}));
@@ -437,7 +438,7 @@ export default function (pi: ExtensionAPI) {
 			mutated = true;
 		}
 
-		// Short-prompt quick-disable: trivial turns ("what time is it")
+		// Short-prompt thinking-skip: trivial turns ("what time is it")
 		// don't need deep thinking. Force the kill switch and let Pi's
 		// zai branch drop the thinking.type="disabled" through.
 		//
@@ -445,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 		// first: loop.shortPrompt is computed once from the initial prompt
 		// and held constant (see before_agent_start). A short prompt that
 		// spawns tool calls stays thinking-free for the whole turn.
-		if (pi.getFlag("glm-quick-disable") === true && loop.shortPrompt) {
+		if (pi.getFlag("glm-skip-short-thinking") === true && loop.shortPrompt) {
 			thinking.type = "disabled";
 			mutated = true;
 		}

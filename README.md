@@ -49,7 +49,7 @@ GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reaso
 | --- | --- | --- |
 | `glm-budget-nudge` | `true` | (a) Appends a soft thinking-budget fragment to the system prompt on every zai/glm-5.2 turn. (b) Per LLM call, sums `reasoning_content` across prior assistant messages in the current agent loop (the one started by the most recent user prompt); if cumulative exceeds ~2000 characters (roughly 500 English tokens), injects a one-shot hint to push the model back toward tool calls. Fires at most once per loop. The hint appears in the conversation panel as a user message prefixed `[system reminder: ...]` — that is intentional, so you can see when the ratchet fired. |
 | `glm-clear-thinking` | `true` | Forces `clear_thinking: true` on every request. The coding endpoint (`api.z.ai/api/coding/paas/v4`) defaults to preserved thinking, which silently compounds `reasoning_content` across turns. At $4.4/MTok output, this is real money. |
-| `glm-quick-disable` | `true` | For user prompts under 80 chars, forces `thinking.type: "disabled"` for that turn. Trivial questions ("what time is it") don't need deep thinking. |
+| `glm-skip-short-thinking` | `true` | For user prompts under 80 chars, forces `thinking.type: "disabled"` for that turn. Trivial questions ("what time is it") don't need deep thinking. |
 
 All three flags surface in `pi config` and Pi's flag editor — `pi config set glm-budget-nudge false` to disable.
 

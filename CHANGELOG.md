@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0 — 2026-06-24
+## 1.1.1 — 2026-06-24
 
 ### Added
 - **`/glm-tweaks` slash command** — in-session flag management.
@@ -82,7 +82,7 @@ Initial release. Pi-native tweaks for Z.AI's GLM-5.2.
 - **Three Pi-idiomatic flags** (auto-surface in `pi config`):
   - `glm-budget-nudge` (default `true`)
   - `glm-clear-thinking` (default `true`)
-  - `glm-quick-disable` (default `true`)
+  - `glm-skip-short-thinking` (default `true`)
 
 ### What the tweaks cannot do
 - Cap thinking tokens at a wire level (Z.AI does not expose a budget param).
