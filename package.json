@@ -1,0 +1,49 @@
+{
+  "name": "@estebanforge/pi-glm-tweaks",
+  "version": "1.0.0",
+  "description": "Pi-native tweaks for Z.AI's GLM-5.2. Restricts the Pi thinking-level UI to the three modes GLM-5.2 actually supports (off, high, max), wires the native thinkingFormat:\"zai\" wire translation, and auto-clamps hidden levels when the model is selected.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "zai",
+    "z-ai",
+    "glm",
+    "glm-5.2",
+    "thinking",
+    "reasoning_effort",
+    "thinking-mode"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "EstebanForge",
+    "email": "esteban@attitude.cl",
+    "url": "https://actitud.xyz"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EstebanForge/pi-glm-tweaks.git"
+  },
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
