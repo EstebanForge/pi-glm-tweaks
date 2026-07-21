@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.2 — 2026-07-21
+
+### Fixed
+- **Flag toggles no longer crash.** `/glm-tweaks <flag>` and the
+  `/glm-tweaks` menu both tried to persist via `pi config set`, which is
+  not a real command (`pi config` only accepts `-l/--approve/--no-approve`;
+  any positional arg throws "Unexpected argument" and exits 1). Every toggle
+  therefore failed with `Failed to apply: <flag>`.
+  - Flags now persist to a tiny file-backed store (`<piDir>/pi-glm-tweaks.json`,
+    `piDir = PI_CODING_AGENT_DIR || ~/.pi/agent`), seeded into `registerFlag`
+    at load. `pi config set` is gone; toggles call `saveFlagSetting` then
+    `/reload` (the reload re-seeds the flag from disk).
+  - Settings now survive a full pi restart too — the old mechanism never
+    persisted at all (extension flags are in-memory only; there is no CLI for
+    them).
+- New `lib/flag-settings.ts` mirrors the file-backed pattern already proven in
+  `pi-asana` and `pi-slack-me`. `lib/` added to the published `files`.
+
 ## 1.1.1 — 2026-06-24
 
 ### Added

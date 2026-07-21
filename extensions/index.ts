@@ -43,6 +43,7 @@
  */
 import { getSettingsListTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
+import { loadFlagSettings, saveFlagSetting } from "../lib/flag-settings";
 
 const PROVIDER = "zai";
 const MODEL_ID = "glm-5.2";
@@ -149,23 +150,30 @@ function renderStatus(
 		...flagLines,
 		"",
 		"toggle: /glm-tweaks toggle <flag>   (shorthand: /glm-tweaks <flag>)",
-		"also:   pi config set <flag> false",
 	].join("\n");
 }
 
 export default function (pi: ExtensionAPI) {
 	// Register Pi-idiomatic flags at factory load time, NOT inside
 	// session_start. registerFlag is static setup; calling it per session
-	// would clobber user preferences on every /new or /reload.
+	// would clobber user preferences on every /new or /reload. Defaults are
+	// seeded from the persisted map in <piDir>/pi-glm-tweaks.json so toggles
+	// survive pi restarts; missing/unknown flags fall back to `true`.
+	const persisted = loadFlagSettings();
 	for (const f of FLAGS) {
-		pi.registerFlag(f.name, { description: f.description, type: "boolean", default: true });
+		pi.registerFlag(f.name, {
+			description: f.description,
+			type: "boolean",
+			default: f.name in persisted ? persisted[f.name] : true,
+		});
 	}
 
 	// /glm-tweaks — status display by default; `toggle <flag>` (or bare
 	// `<flag>`) flips a boolean. ExtensionAPI exposes no live setFlag, so a
-	// toggle persists via `pi config set` and then reloads the session so
-	// the in-memory flag value picks up the change. ctx is stale after
-	// reload() — we notify first, reload last, and return immediately.
+	// toggle is written to <piDir>/pi-glm-tweaks.json (lib/flag-settings.ts)
+	// and then reloads the session so registerFlag re-seeds the in-memory
+	// default from disk. ctx is stale after reload() — we notify first,
+	// reload last, and return immediately.
 	pi.registerCommand("glm-tweaks", {
 		description: "GLM-5.2 tweaks: show status, or toggle a flag. Usage: /glm-tweaks [toggle <flag>]",
 		getArgumentCompletions: (prefix: string) => {
@@ -196,7 +204,7 @@ export default function (pi: ExtensionAPI) {
 			const trimmed = args.trim();
 
 			// Toggle mode: `/glm-tweaks toggle <flag>` or `/glm-tweaks <flag>`.
-			// Direct one-shot flip — persists via `pi config set` then reloads.
+			// Direct one-shot flip — persists to the settings file then reloads.
 			// Bare `/glm-tweaks toggle` (no flag) falls through to the menu.
 			if (trimmed !== "" && trimmed !== "status" && trimmed !== "toggle") {
 				const tokens = trimmed.split(/\s+/).filter(Boolean);
@@ -211,12 +219,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				const current = pi.getFlag(meta.name) === true;
 				const next = !current;
-				const result = await pi.exec("pi", ["config", "set", meta.name, String(next)]);
-				if (result.code !== 0) {
-					ctx.ui.notify(
-						`Failed to set ${meta.name}: ${result.stderr.trim() || `exit ${result.code}`}`,
-						"error",
-					);
+				if (!saveFlagSetting(meta.name, next)) {
+					ctx.ui.notify(`Failed to persist ${meta.name} to settings file.`, "error");
 					return;
 				}
 				ctx.ui.notify(`${meta.name}: ${current} → ${next}. Reloading...`, "info");
@@ -226,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Status/menu mode. In TUI, open an interactive SettingsList
 			// (same component /settings uses) so the user can flip several
-			// flags in one visit; changes persist via `pi config set` and a
+			// flags in one visit; changes persist to the settings file and a
 			// single reload fires on close. Outside TUI (RPC/headless), fall
 			// back to the read-only status panel — custom components are
 			// terminal-only.
@@ -289,11 +293,10 @@ export default function (pi: ExtensionAPI) {
 
 			const failures: string[] = [];
 			for (const [name, val] of deltas) {
-				const r = await pi.exec("pi", ["config", "set", name, String(val)]);
-				if (r.code !== 0) failures.push(`${name} (${r.stderr.trim() || `exit ${r.code}`})`);
+				if (!saveFlagSetting(name, val)) failures.push(name);
 			}
 			if (failures.length > 0) {
-				ctx.ui.notify(`Failed to apply: ${failures.join("; ")}`, "error");
+				ctx.ui.notify(`Failed to persist: ${failures.join(", ")}`, "error");
 				return;
 			}
 			ctx.ui.notify(`Applied ${deltas.length} change(s). Reloading...`, "info");

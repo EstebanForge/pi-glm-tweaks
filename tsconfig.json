@@ -13,5 +13,5 @@
     "tsBuildInfoFile": "./node_modules/.cache/pi-glm-tweaks.tsbuildinfo",
     "rootDir": "."
   },
-  "include": ["extensions/**/*.ts"]
+  "include": ["extensions/**/*.ts", "lib/**/*.ts"]
 }
