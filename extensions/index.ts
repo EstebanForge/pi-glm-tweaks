@@ -28,15 +28,19 @@
  *     and notify. Set the footer status hint.
  *   - On model_select to any other model, clear the footer status.
  *   - On every user turn, inject a soft system-prompt budget fragment
- *     (`glm-budget-nudge`, default on).
+ *     (`glm-budget-nudge`, default OFF — rewrites the system prompt every
+ *     turn, which drifts the cached prefix).
  *   - Per LLM call, count cumulative reasoning_content; if over a
  *     threshold, inject a one-shot user-side hint to push the model back
  *     toward tool calls (`glm-budget-nudge`).
- *   - On every outgoing request, force `clear_thinking: true` (the coding
- *     endpoint defaults to preserved thinking, which silently compounds
- *     `reasoning_content` across turns). `glm-clear-thinking`, default on.
+ *   - On every outgoing request, force `clear_thinking: true`
+ *     (`glm-clear-thinking`, default OFF). The coding endpoint ships Preserved
+ *     Thinking ON by default precisely to maximize cache hit rates (see
+ *     z.ai Thinking Mode docs); forcing it off re-bills the full prefix
+ *     every turn.
  *   - On short user prompts (<80 chars), force `thinking.type: "disabled"`
- *     to save tokens on trivial turns. `glm-skip-short-thinking`, default on.
+ *     to save tokens on trivial turns (`glm-skip-short-thinking`, default
+ *     OFF — toggling request shape turn-to-turn reduces cache hits).
  *
  * Auth is untouched. The provider's existing key (ZAI_API_KEY env, /login,
  * or models.json apiKey) continues to resolve against the new baseUrl.
@@ -63,24 +67,31 @@ const RATCHET_THRESHOLD_CHARS = 2_000;
 
 // Token-efficiency flags. Single source of truth — drives registerFlag,
 // the /glm-tweaks status display, autocomplete, and the toggle subcommand.
-// All default on. See README for what each does at the wire level.
+// All default OFF: each one trades cache stability for token savings on
+// the z.ai coding endpoint, where Preserved Thinking is on by default to
+// maximize cache hits (see docs.z.ai/guides/capabilities/thinking-mode).
+// Users who want the aggressive tweaks can opt in via /glm-tweaks.
 const FLAGS = [
 	{
 		name: "glm-budget-nudge",
 		label: "Budget nudge",
+		default: false,
 		description:
-			"Inject a soft thinking-budget system-prompt fragment and intra-loop ratchet for zai/glm-5.2.",
+			"Every turn, append a thinking-budget fragment to the system prompt; mid-loop, if reasoning exceeds ~2000 chars, inject a timestamped user message pushing the model toward a tool call. Cache: both mutations rewrite the prefix (system prompt is the start of the cached prefix, and the injected message carries Date.now()), so the server cannot reuse the prior turn's cache — full re-bill every turn.",
 	},
 	{
 		name: "glm-clear-thinking",
 		label: "Clear thinking",
+		default: false,
 		description:
-			"Force clear_thinking=true on zai/glm-5.2 requests to prevent cross-turn reasoning_content carryover on the coding endpoint.",
+			"Force thinking.clear_thinking=true on every request, opting out of z.ai Preserved Thinking. Cache: Preserved Thinking (clear_thinking=false) is the coding endpoint's default because it keeps reasoning_content byte-identical across turns, which is exactly what the server caches; disabling it strips reasoning each turn so the next turn's prefix no longer matches the cache → full re-bill (e.g. 'Cache miss: 140k tokens re-billed').",
 	},
 	{
 		name: "glm-skip-short-thinking",
 		label: "Skip short thinking",
-		description: "Disable thinking on short user prompts (<80 chars) to save tokens on trivial turns.",
+		default: false,
+		description:
+			"For user prompts under 80 chars, force thinking.type=disabled for that turn. Cache: toggles thinking on/off across turns based on prompt length, which changes the reasoning_content sequence z.ai caches; follow-up turns on the same session re-bill instead of hitting the cached prefix.",
 	},
 ] as const;
 
@@ -158,13 +169,22 @@ export default function (pi: ExtensionAPI) {
 	// session_start. registerFlag is static setup; calling it per session
 	// would clobber user preferences on every /new or /reload. Defaults are
 	// seeded from the persisted map in <piDir>/pi-glm-tweaks.json so toggles
-	// survive pi restarts; missing/unknown flags fall back to `true`.
+	// survive pi restarts; missing/unknown flags fall back to the flag's own
+	// `default` (cache-safe: all three token-efficiency flags default off).
+	//
+	// Persisted-wins is the load-bearing invariant for the v1.2.0 default
+	// flip: a 1.1.2 user who explicitly toggled a flag to `true` (even though
+	// that matched the old default, so the toggle looked like a no-op at the
+	// time) has a real `{ "<flag>": true }` entry on disk today, and
+	// `f.name in persisted` picks it up post-upgrade so their explicit
+	// choice is preserved. The one-shot toggle handler persists every flip
+	// unconditionally (no no-op skip), which is what makes this hold.
 	const persisted = loadFlagSettings();
 	for (const f of FLAGS) {
 		pi.registerFlag(f.name, {
 			description: f.description,
 			type: "boolean",
-			default: f.name in persisted ? persisted[f.name] : true,
+			default: f.name in persisted ? persisted[f.name] : f.default,
 		});
 	}
 
@@ -432,10 +452,11 @@ export default function (pi: ExtensionAPI) {
 
 		let mutated = false;
 
-		// Force clear_thinking on every request. The coding endpoint
-		// defaults to preserved thinking (clear_thinking: false), which
-		// silently compounds reasoning_content across turns. Cost at
-		// $4.4/MTok output makes this materially expensive.
+		// Opt out of z.ai Preserved Thinking. The coding endpoint ships
+		// clear_thinking=false ON BY DEFAULT because preserving reasoning
+		// across turns is what makes the prefix cacheable (see z.ai Thinking
+		// Mode docs). Flipping this on re-bills the full prefix every turn —
+		// hence default OFF and opt-in only.
 		if (pi.getFlag("glm-clear-thinking") === true) {
 			thinking.clear_thinking = true;
 			mutated = true;

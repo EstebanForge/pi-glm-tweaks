@@ -43,15 +43,17 @@ This extension collapses that mismatch:
 
 ## Token-efficiency tweaks
 
-GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reasoning_content` without taking a tool call. The Z.AI API does not expose a `max_thinking_tokens` parameter, so the post that popularised this observation does it at the provider layer (mid-stream injection). We can't intercept the stream, but we can approximate the win with three cheap, opt-out tweaks:
+GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reasoning_content` without taking a tool call. The Z.AI API does not expose a `max_thinking_tokens` parameter, so the post that popularised this observation does it at the provider layer (mid-stream injection). We can't intercept the stream, but we can approximate the win with three opt-in tweaks.
+
+**All three default OFF.** Each one trades z.ai server-side cache stability for token savings, and the cache re-bill usually costs more than it saves. Per [docs.z.ai Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode): Preserved Thinking (`clear_thinking: false`) is **on by default on the coding endpoint** precisely because it "increases cache hit rates — saving tokens in real tasks." Opt in only if you've measured that thinking tokens, not cache misses, are your real cost driver.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `glm-budget-nudge` | `true` | (a) Appends a soft thinking-budget fragment to the system prompt on every zai/glm-5.2 turn. (b) Per LLM call, sums `reasoning_content` across prior assistant messages in the current agent loop (the one started by the most recent user prompt); if cumulative exceeds ~2000 characters (roughly 500 English tokens), injects a one-shot hint to push the model back toward tool calls. Fires at most once per loop. The hint appears in the conversation panel as a user message prefixed `[system reminder: ...]` — that is intentional, so you can see when the ratchet fired. |
-| `glm-clear-thinking` | `true` | Forces `clear_thinking: true` on every request. The coding endpoint (`api.z.ai/api/coding/paas/v4`) defaults to preserved thinking, which silently compounds `reasoning_content` across turns. At $4.4/MTok output, this is real money. |
-| `glm-skip-short-thinking` | `true` | For user prompts under 80 chars, forces `thinking.type: "disabled"` for that turn. Trivial questions ("what time is it") don't need deep thinking. |
+| `glm-budget-nudge` | `false` | (a) Appends a soft thinking-budget fragment to the system prompt on every zai/glm-5.2 turn. (b) Per LLM call, sums `reasoning_content` across prior assistant messages in the current agent loop (the one started by the most recent user prompt); if cumulative exceeds ~2000 characters (roughly 500 English tokens), injects a one-shot hint to push the model back toward tool calls. Fires at most once per loop. The hint appears in the conversation panel as a user message prefixed `[system reminder: ...]` — that is intentional, so you can see when the ratchet fired. **Cache:** both mutations rewrite the cached prefix — the system prompt is the start of the cached prefix, and the injected message carries `Date.now()` — so the server cannot reuse the prior turn's cache and re-bills every turn. |
+| `glm-clear-thinking` | `false` | Forces `clear_thinking: true` on every request, opting out of z.ai Preserved Thinking. Preserved Thinking is the coding endpoint's default and is what keeps the prefix byte-stable across turns (so it caches). Disabling it re-bills the full prefix every turn — usually a net loss. |
+| `glm-skip-short-thinking` | `false` | For user prompts under 80 chars, forces `thinking.type: "disabled"` for that turn. **Cache:** toggling thinking on/off across turns based on prompt length changes the reasoning_content sequence z.ai caches, so follow-up turns on the same session re-bill instead of hitting the cached prefix. |
 
-All three flags surface in `pi config` and Pi's flag editor — `pi config set glm-budget-nudge false` to disable.
+All three flags surface in `pi config` and Pi's flag editor — `pi config set glm-budget-nudge true` to enable. Or flip them from inside Pi with `/glm-tweaks`.
 
 ## `/glm-tweaks` command
 

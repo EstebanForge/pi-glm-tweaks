@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.0 — 2026-07-23
+
+### Changed
+- **All three token-efficiency flags now default OFF.** `glm-budget-nudge`,
+  `glm-clear-thinking`, and `glm-skip-short-thinking` shipped defaulting to
+  `true` in 1.1.x. Per [z.ai Thinking Mode docs](https://docs.z.ai/guides/capabilities/thinking-mode),
+  Preserved Thinking (`clear_thinking: false`) is **on by default on the
+  coding endpoint** specifically because it "increases cache hit rates —
+  saving tokens in real tasks." All three flags undermine that caching:
+  - `glm-clear-thinking` forces `clear_thinking: true`, stripping
+    `reasoning_content` each turn so the next-turn prefix no longer
+    byte-matches the server cache (full re-bill, e.g. "Cache miss: 140k
+    tokens re-billed").
+  - `glm-budget-nudge` rewrites the system prompt every turn (prefix drift)
+    and injects a timestamped `[system reminder: ...]` user message when the
+    ratchet fires (non-deterministic prefix).
+  - `glm-skip-short-thinking` toggles `thinking.type` between `enabled` and
+    `disabled` turn-to-turn (request-shape change).
+
+  Existing users who persisted a value via `/glm-tweaks` keep their choice —
+  the file-backed store still wins over the default. **Users who never ran
+  `/glm-tweaks` were silently running all three tweaks ON under 1.1.x** (that
+  was the implicit default); after upgrading they flip to OFF. If you were
+  relying on them, re-enable with `/glm-tweaks` or
+  `pi config set <flag> true`. New installs get the cache-safe defaults.
+
 ## 1.1.2 — 2026-07-21
 
 ### Fixed
