@@ -17,10 +17,10 @@
     byte-matched the server cache (full re-bill, e.g. "Cache miss: 140k
     tokens re-billed"). Now defaults OFF.
   - `glm-budget-nudge` rewrites the system prompt every turn and (in 1.1.x)
-    injected a timestamped `[system reminder: ...]` user message when the
-    ratchet fired. The constant fragment append is cache-safe on its own;
-    the ratchet is not, so the ratchet is gone (see Removed) and the flag
-    keeps just the fragment, defaulting ON.
+    appended a reactive `[system reminder: ...]` user message after the last
+    tool result when the ratchet fired. The constant fragment append is
+    cache-safe on its own; the ratchet is not (see Removed), so the ratchet
+    is gone and the flag keeps just the fragment, defaulting ON.
   - `glm-skip-short-thinking` toggles `thinking.type` between `enabled` and
     `disabled` turn-to-turn (request-shape change). Now defaults OFF.
 
@@ -34,12 +34,16 @@
 ### Removed
 - **Mid-loop ratchet injection deleted.** Previously, when cumulative
   `reasoning_content` in the current agent loop exceeded ~2000 chars, the
-  `context` hook appended a `[system reminder: ...]` user message with
-  `timestamp: Date.now()` to push the model toward a tool call. That
-  timestamp made the prefix non-deterministic, so the server could not reuse
-  the prior turn's cache (full re-bill every turn it fired). The upfront
-  system-prompt fragment covers the same intent (steer toward a tool call
-  before overthinking) without breaking the cache, so the reactive ratchet
+  `context` hook appended a `[system reminder: ...]` user message after the
+  last tool result to push the model toward a tool call. The hint sat between
+  the cached prefix and the model's about-to-generate next turn, displacing
+  that turn from the next call's cache-reusable prefix and forcing a
+  one-time re-ingest of the fired turn's tokens (a one-shot cost, not a
+  per-turn re-bill — the hint was ephemeral and gone from the next call). It
+  also fired precisely when reasoning was largest, so it re-ingested the
+  biggest block — the opposite of the intent. The upfront system-prompt
+  fragment covers the same intent (steer toward a tool call before
+  overthinking) without displacing the cached tail, so the reactive ratchet
   is gone. The `RATCHET_THRESHOLD_CHARS` constant and the `loop.ratchetFired`
   field are removed with it.
 

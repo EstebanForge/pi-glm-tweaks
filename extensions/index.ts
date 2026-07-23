@@ -76,7 +76,7 @@ const FLAGS = [
 		label: "Budget nudge",
 		default: true,
 		description:
-			"Append a constant thinking-budget fragment to the system prompt on every zai/glm-5.2 turn, steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet that injected a timestamped user message was removed because it broke the cache.)",
+			"Append a constant thinking-budget fragment to the system prompt on every zai/glm-5.2 turn, steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet appended a reactive hint message after the last tool result; the hint sat between the cached prefix and the model's next turn, displacing that turn from the cache and forcing a one-time re-ingest. It fired precisely when reasoning was largest, so it is gone.)",
 	},
 	{
 		name: "glm-clear-thinking",
