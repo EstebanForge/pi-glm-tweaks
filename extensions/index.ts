@@ -4,7 +4,7 @@
  * Restricts the Pi thinking-level UI to the three modes GLM-5.2 actually
  * supports (off, high, max), wires the native `thinkingFormat: "zai"` wire
  * translation, auto-clamps hidden levels, and applies token-efficiency
- * hygiene (per-turn system-prompt nudge, intra-loop ratchet, wire-level
+ * hygiene (per-turn system-prompt nudge, wire-level
  * clear_thinking and skip-short-thinking).
  *
  * Wire map (see https://docs.z.ai/guides/capabilities/thinking and
@@ -58,26 +58,25 @@ const ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 // with the provider's default mapping (here: thinking.type="disabled").
 const HIDDEN_LEVELS = new Set(["minimal", "low", "medium"]);
 
-// Token-efficiency tuning constants. Hardcoded for v1 — exposed as flags
-// would be over-engineering for a single-model extension. Bump these in
-// a future minor if users report the ratchet firing too eagerly / not
-// eagerly enough.
+// Token-efficiency tuning constant. Hardcoded for v1 — exposed as a flag
+// would be over-engineering for a single-model extension.
 const SHORT_PROMPT_THRESHOLD = 80;
-const RATCHET_THRESHOLD_CHARS = 2_000;
 
 // Token-efficiency flags. Single source of truth — drives registerFlag,
 // the /glm-tweaks status display, autocomplete, and the toggle subcommand.
-// All default OFF: each one trades cache stability for token savings on
-// the z.ai coding endpoint, where Preserved Thinking is on by default to
-// maximize cache hits (see docs.z.ai/guides/capabilities/thinking-mode).
-// Users who want the aggressive tweaks can opt in via /glm-tweaks.
+// glm-budget-nudge defaults ON (cache-safe: it appends a fixed fragment to
+// the system prompt, so the prefix stays byte-identical turn to turn and the
+// z.ai server cache is reused). The other two default OFF because they
+// undermine the coding endpoint's Preserved Thinking caching
+// (see docs.z.ai/guides/capabilities/thinking-mode). Users who want them can
+// opt in via /glm-tweaks.
 const FLAGS = [
 	{
 		name: "glm-budget-nudge",
 		label: "Budget nudge",
-		default: false,
+		default: true,
 		description:
-			"Every turn, append a thinking-budget fragment to the system prompt; mid-loop, if reasoning exceeds ~2000 chars, inject a timestamped user message pushing the model toward a tool call. Cache: both mutations rewrite the prefix (system prompt is the start of the cached prefix, and the injected message carries Date.now()), so the server cannot reuse the prior turn's cache — full re-bill every turn.",
+			"Append a constant thinking-budget fragment to the system prompt on every zai/glm-5.2 turn, steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet that injected a timestamped user message was removed because it broke the cache.)",
 	},
 	{
 		name: "glm-clear-thinking",
@@ -329,8 +328,7 @@ export default function (pi: ExtensionAPI) {
 	// flags + recomputing in every hook. Reset on every before_agent_start.
 	const loop: {
 		shortPrompt: boolean;
-		ratchetFired: boolean;
-	} = { shortPrompt: false, ratchetFired: false };
+	} = { shortPrompt: false };
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Build the full `zai` provider model list, patching only glm-5.2.
@@ -373,9 +371,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event, ctx) => {
 		// Reset per-loop state at the start of each user turn. The other
-		// hooks read these to drive their per-turn behavior.
+		// hooks read this to drive their per-turn behavior.
 		loop.shortPrompt = event.prompt.length < SHORT_PROMPT_THRESHOLD;
-		loop.ratchetFired = false;
 
 		if (!isZaiGlm52(ctx.model)) return {};
 		if (pi.getFlag("glm-budget-nudge") !== true) return {};
@@ -385,58 +382,6 @@ export default function (pi: ExtensionAPI) {
 		// our systemPrompt replaces the upstream value, and other
 		// extensions downstream only see what we return.
 		return { systemPrompt: (event.systemPrompt ?? "") + BUDGET_FRAGMENT };
-	});
-
-	pi.on("context", (event, ctx) => {
-		if (!isZaiGlm52(ctx.model)) return {};
-		if (pi.getFlag("glm-budget-nudge") !== true) return {};
-		if (loop.ratchetFired) return {};
-
-		// Sum reasoning from assistant messages in the CURRENT agent loop
-		// only. Find the boundary by walking back to the last `role: "user"`
-		// message (the prompt that started this loop). toolResult / assistant
-		// / custom / etc. are not user role, so they don't reset the boundary.
-		// Without this scoping, a long session would fire the ratchet on the
-		// first LLM call of every new turn regardless of current-loop thinking.
-		//
-		// Pi stores assistant thinking in content[] as ThinkingContent blocks
-		// ({type:"thinking", thinking:string}) — NOT a top-level
-		// `reasoning_content` field (that's the Z.AI wire name). Reading the
-		// wrong field was a 1.0.0 bug that left the ratchet permanently dead.
-		let loopStart = event.messages.length - 1;
-		while (loopStart > 0) {
-			const m = event.messages[loopStart] as { role?: string } | undefined;
-			if (m?.role === "user") break;
-			loopStart--;
-		}
-
-		let totalReasoning = 0;
-		for (let i = loopStart + 1; i < event.messages.length; i++) {
-			const m = event.messages[i];
-			if (typeof m !== "object" || m === null) continue;
-			const msg = m as { role?: string; content?: unknown };
-			if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
-			for (const block of msg.content) {
-				if (
-					block &&
-					typeof block === "object" &&
-					(block as { type?: string }).type === "thinking" &&
-					typeof (block as { thinking?: unknown }).thinking === "string"
-				) {
-					totalReasoning += (block as { thinking: string }).thinking.length;
-				}
-			}
-		}
-		if (totalReasoning < RATCHET_THRESHOLD_CHARS) return {};
-
-		loop.ratchetFired = true;
-		const hint = {
-			role: "user",
-			content:
-				"[system reminder: you've been thinking extensively without taking a tool call. Take a tool call now or wrap up your response.]",
-			timestamp: Date.now(),
-		};
-		return { messages: [...event.messages, hint as never] };
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {

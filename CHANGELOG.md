@@ -3,28 +3,45 @@
 ## 1.2.0 — 2026-07-23
 
 ### Changed
-- **All three token-efficiency flags now default OFF.** `glm-budget-nudge`,
-  `glm-clear-thinking`, and `glm-skip-short-thinking` shipped defaulting to
-  `true` in 1.1.x. Per [z.ai Thinking Mode docs](https://docs.z.ai/guides/capabilities/thinking-mode),
+- **Token-efficiency flags rebalanced for cache safety.**
+  `glm-clear-thinking` and `glm-skip-short-thinking` now default OFF, and
+  `glm-budget-nudge` defaults ON but cache-safe. All three shipped defaulting
+  to ON in 1.1.x, and each broke the z.ai server cache in a different way.
+  Per [z.ai Thinking Mode docs](https://docs.z.ai/guides/capabilities/thinking-mode),
   Preserved Thinking (`clear_thinking: false`) is **on by default on the
   coding endpoint** specifically because it "increases cache hit rates —
-  saving tokens in real tasks." All three flags undermine that caching:
-  - `glm-clear-thinking` forces `clear_thinking: true`, stripping
+  saving tokens in real tasks" by keeping `reasoning_content` byte-identical
+  across turns.
+  - `glm-clear-thinking` forced `clear_thinking: true`, stripping
     `reasoning_content` each turn so the next-turn prefix no longer
-    byte-matches the server cache (full re-bill, e.g. "Cache miss: 140k
-    tokens re-billed").
-  - `glm-budget-nudge` rewrites the system prompt every turn (prefix drift)
-    and injects a timestamped `[system reminder: ...]` user message when the
-    ratchet fires (non-deterministic prefix).
+    byte-matched the server cache (full re-bill, e.g. "Cache miss: 140k
+    tokens re-billed"). Now defaults OFF.
+  - `glm-budget-nudge` rewrites the system prompt every turn and (in 1.1.x)
+    injected a timestamped `[system reminder: ...]` user message when the
+    ratchet fired. The constant fragment append is cache-safe on its own;
+    the ratchet is not, so the ratchet is gone (see Removed) and the flag
+    keeps just the fragment, defaulting ON.
   - `glm-skip-short-thinking` toggles `thinking.type` between `enabled` and
-    `disabled` turn-to-turn (request-shape change).
+    `disabled` turn-to-turn (request-shape change). Now defaults OFF.
 
   Existing users who persisted a value via `/glm-tweaks` keep their choice —
   the file-backed store still wins over the default. **Users who never ran
-  `/glm-tweaks` were silently running all three tweaks ON under 1.1.x** (that
-  was the implicit default); after upgrading they flip to OFF. If you were
-  relying on them, re-enable with `/glm-tweaks` or
-  `pi config set <flag> true`. New installs get the cache-safe defaults.
+  `/glm-tweaks` were silently running the 1.1.x behavior (fragment + ratchet
+  + clear-thinking + skip-short, all ON);** after upgrading they get the
+  fragment only. Re-enable the others with `/glm-tweaks` or
+  `pi config set <flag> true`.
+
+### Removed
+- **Mid-loop ratchet injection deleted.** Previously, when cumulative
+  `reasoning_content` in the current agent loop exceeded ~2000 chars, the
+  `context` hook appended a `[system reminder: ...]` user message with
+  `timestamp: Date.now()` to push the model toward a tool call. That
+  timestamp made the prefix non-deterministic, so the server could not reuse
+  the prior turn's cache (full re-bill every turn it fired). The upfront
+  system-prompt fragment covers the same intent (steer toward a tool call
+  before overthinking) without breaking the cache, so the reactive ratchet
+  is gone. The `RATCHET_THRESHOLD_CHARS` constant and the `loop.ratchetFired`
+  field are removed with it.
 
 ## 1.1.2 — 2026-07-21
 
