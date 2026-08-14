@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0 — 2026-08-14
+
+### Added
+- **GLM-5.3 support.** New `MODEL_SPECS` table drives everything: the
+  extension now patches `glm-5.2`, `glm-5.3`, and the 1M-context
+  `glm-5.3[1m]` Coding Plan route, each with its own thinking map. GLM-5.3
+  removed `thinking.type: "disabled"` (direct API rejects it) and added a
+  real `low` wire level, so 5.3 maps Pi `off`/`low` to
+  `thinking enabled + reasoning_effort: "low"` (z.ai's documented
+  migration) and hides `minimal`/`medium`. Footer hint and clamp messages
+  are derived per model (`low | high | max` on 5.3, `off | high | max` on
+  5.2).
+- `glm-skip-short-thinking` on 5.3 now forces `enabled` + `low` instead
+  of the rejected `disabled`.
+- Tests: session_start registration coverage for the multi-spec build
+  (5.3 map, pass-through of untargeted models, no-op when no target).
+- **Forward compatibility for glm-5.4+.** `resolveSpec()`: an unknown
+  `glm-5.N` with N >= 3 (including `[1m]`) inherits the glm-5.3 spec, so a
+  rushed 5.4 release works day one. Explicit `MODEL_SPECS` entries always
+  win; glm-4.x and future glm-6 are excluded (unknown wire contracts).
+- **Request-layer `disabled` guard for 5.3+** (peer-review fix): Pi's zai
+  transport (openai-completions.js) sends `thinking.type:"disabled"`
+  whenever the reasoning effort is undefined — exactly the Pi level-`off`
+  path — and the model's `thinkingLevelMap` is never consulted there, so
+  the map's `off:"low"` entry alone could not prevent a rejected request.
+  `before_provider_request` now unconditionally rewrites `disabled` to
+  `enabled` + `reasoning_effort:"low"` on any spec with
+  `canDisableThinking: false`. New test exercises the wire payload
+  directly (5.3 rewritten, 5.2 untouched).
+
 ## 1.2.1 — 2026-08-06
 
 ### Changed
