@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.4.0 — 2026-08-19
+
+### Added
+- **API route selection (`glm-api-route`: `coding` | `anthropic`).** Both
+  z.ai GLM Coding Plan protocols are now user-selectable per installation
+  (same key, same credits — [docs](https://docs.z.ai/devpack/quick-start)):
+  - `coding` (default, unchanged): OpenAI Chat Completions at
+    `api.z.ai/api/coding/paas/v4` with implicit prefix caching and the
+    documented `thinking` + `reasoning_effort` contract.
+  - `anthropic`: Anthropic Messages at `api.z.ai/api/anthropic`, activating
+    Pi's native `cache_control` breakpoints. Verified by live probe: a
+    repeated ~122k-token prefix read 122,560/122,581 tokens from cache.
+    Thinking is translated per-request to z.ai's probed shape
+    (`thinking: {type: "enabled", reasoning_effort: "low|high|max"}` —
+    nested, never `disabled`, which the endpoint silently ignores).
+  - Switch via `/glm-tweaks route <coding|anthropic>` or the interactive
+    menu; applied through the existing persist + reload path.
+- Footer chip showing the active route (`OAI` / `ANT`) next to the thinking
+  chip, cleared on non-GLM model select.
+- `lib/flag-settings.ts` widened to `boolean | string` values
+  (`loadSettings` / `loadStringSettings` / `saveSetting`); pre-1.4 settings
+  files load unchanged.
+- Tests for route registration, thinking replacement, the
+  disabled-silent-ignore hazard, coding-route isolation, and the
+  cross-session settings-flip regression.
+
+### Notes
+- **Peer-reviewed** (two rounds): the anthropic request-shape branch keys
+  off the registered model's `api` field, not a fresh settings read, so a
+  concurrent pi session flipping the route on disk cannot miswire another
+  session's requests. `supportsLongCacheRetention` is pinned `false` on the
+  anthropic route until z.ai documents `ttl:"1h"`.
+- The anthropic route reports `cache_read_input_tokens` but no
+  `cache_creation_input_tokens`, so Pi's cache-write column reads 0 there
+  (display only; cached tokens still bill at the discounted rate).
+- Switching routes mid-conversation replays prior turns' reasoning as plain
+  text (Pi degrades thinking blocks without signatures on replay); start a
+  fresh session for a clean A/B.
+
 ## 1.3.0 — 2026-08-14
 
 ### Added

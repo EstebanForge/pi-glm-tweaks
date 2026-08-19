@@ -87,6 +87,7 @@ An in-session command for inspecting and flipping the flags above without leavin
 | `/glm-tweaks` (non-TUI / RPC) | Falls back to a read-only status panel (active model, thinking level vs the `off \| high \| max` map, and each flag's on/off state). |
 | `/glm-tweaks toggle <flag>` | One-shot flip: persists, then reloads. |
 | `/glm-tweaks <flag>` | Shorthand one-shot toggle (flag name without the `toggle` keyword). |
+| `/glm-tweaks route <coding\|anthropic>` | Switch the z.ai API route for targeted GLM models: persists, then reloads. |
 
 The command offers tab-completion for `toggle` and the three flag names.
 
@@ -98,6 +99,22 @@ The command offers tab-completion for `toggle` and the three flag names.
 - Inject text mid-stream. No Pi hook for streaming chunk mutation.
 - Force the model to call a tool. The system prompt can ask; nothing forces it.
 - Lower `reasoning_effort` per-request. Per [KiwiGaze/glm-for-copilot #7](https://github.com/KiwiGaze/glm-for-copilot/issues/7) it's a no-op on `/chat/completions`.
+
+## API route selection
+
+Z.AI's GLM Coding Plan accepts the same key and the same credit billing on two protocols ([docs](https://docs.z.ai/devpack/quick-start)):
+
+| Route | Endpoint | Caching | Thinking |
+| --- | --- | --- | --- |
+| `coding` (default) | `https://api.z.ai/api/coding/paas/v4` (OpenAI Chat Completions) | Implicit server-side prefix caching (Preserved Thinking keeps the prefix byte-identical) | `thinking.type` + `reasoning_effort`, z.ai's documented contract |
+| `anthropic` | `https://api.z.ai/api/anthropic` (Anthropic Messages) | Explicit `cache_control` breakpoints (Pi marks system, last tool, last message; verified: a repeated ~122k-token prefix read 122,560 tokens from cache) | `thinking: {type: "enabled", reasoning_effort}` translated per-request by this extension |
+
+Switch with `/glm-tweaks route anthropic` (or from the interactive menu). Notes:
+
+- **Usage display**: the Anthropic route reports `cache_read_input_tokens` but no `cache_creation_input_tokens`, so Pi's cache-write column reads 0 there. The cached tokens still bill at the discounted rate.
+- **Mid-conversation switching** is supported but prior turns' reasoning replays as plain text (Pi's Anthropic provider degrades thinking blocks without signatures on replay). Start a fresh session for a clean A/B.
+- **The anthropic route never sends `thinking.type: "disabled"`**: z.ai silently ignores it there (the model keeps thinking, nothing errors). The extension always rewrites to `enabled` + the lightest effort, same safety net as the coding route.
+- Long cache retention (`ttl: "1h"`) is pinned off on the anthropic route until z.ai documents it; the default 5-minute ephemeral window covers in-session reuse.
 
 ## Why this exists
 

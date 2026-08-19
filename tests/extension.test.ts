@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import factory from "../extensions/index.js";
 
 type SessionStartHandler = (event: unknown, ctx: unknown) => void | Promise<void>;
@@ -144,5 +147,116 @@ describe("pi-glm-tweaks extension entry", () => {
 		}
 		// glm-5.1 predates the new contract: untouched, no fallback.
 		expect(models.find((x) => x.id === "glm-5.1")).toEqual({ provider: "zai", id: "glm-5.1" });
+	});
+});
+
+describe("glm-api-route setting", () => {
+	const tempDirs: string[] = [];
+
+	function withRouteSetting(value: string) {
+		const dir = mkdtempSync(join(tmpdir(), "glm-tweaks-test-"));
+		tempDirs.push(dir);
+		writeFileSync(join(dir, "pi-glm-tweaks.json"), JSON.stringify({ "glm-api-route": value }));
+		process.env.PI_CODING_AGENT_DIR = dir;
+	}
+
+	afterEach(() => {
+		delete process.env.PI_CODING_AGENT_DIR;
+		for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("registers anthropic route models against api.z.ai/api/anthropic with pinned compat", async () => {
+		withRouteSetting("anthropic");
+		const { pi, handlers, state, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		await factory(pi as unknown as TestPi);
+		await handlers.session_start(undefined, ctx);
+
+		const models = (state.registered!.def as { models: Array<Record<string, unknown>> }).models;
+		const glm53 = models.find((m) => m.id === "glm-5.3") as Record<string, any>;
+		expect(glm53.api).toBe("anthropic-messages");
+		expect(glm53.baseUrl).toBe("https://api.z.ai/api/anthropic");
+		// Unprobed ttl must never be requested: pin long retention off.
+		expect(glm53.compat.supportsLongCacheRetention).toBe(false);
+		// OpenAI-shape compat flags do not carry over.
+		expect(glm53.compat.thinkingFormat).toBeUndefined();
+		expect(glm53.compat.zaiToolStream).toBeUndefined();
+		// The thinking map still drives UI-hide/clamp on both routes.
+		expect(glm53.thinkingLevelMap.high).toBe("high");
+	});
+
+	it("coding route (default) keeps the documented OpenAI-shape contract", async () => {
+		const { pi, handlers, state, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		await factory(pi as unknown as TestPi);
+		await handlers.session_start(undefined, ctx);
+
+		const models = (state.registered!.def as { models: Array<Record<string, unknown>> }).models;
+		const glm53 = models.find((m) => m.id === "glm-5.3") as Record<string, any>;
+		expect(glm53.api).toBe("openai-completions");
+		expect(glm53.baseUrl).toBe("https://api.z.ai/api/coding/paas/v4");
+		expect(glm53.compat.thinkingFormat).toBe("zai");
+		expect(glm53.compat.zaiToolStream).toBe(true);
+	});
+
+	it("anthropic route replaces Pi's budget-based thinking with enabled+reasoning_effort", async () => {
+		withRouteSetting("anthropic");
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		const pi2 = { ...pi, getThinkingLevel: () => "xhigh" } as unknown as TestPi;
+		await factory(pi2);
+		// The branch keys off the REGISTERED model's api field, mirroring
+		// what session_start built from the persisted route.
+		(ctx as { model: { api?: string } }).model = { provider: "zai", id: "glm-5.3", api: "anthropic-messages" };
+
+		// Pi's anthropic provider emits budget-based thinking; the route
+		// branch must REPLACE the object, not merge into it.
+		const evt = { payload: { thinking: { type: "enabled", budget_tokens: 8192, display: "summarized" } } };
+		const out = handlers.before_provider_request(evt, ctx) as Record<string, any>;
+		expect(out.thinking).toEqual({ type: "enabled", reasoning_effort: "max" });
+		// budget_tokens/display dropped, no top-level effort field (the
+		// endpoint ignores a top-level reasoning_effort silently).
+		expect(out.reasoning_effort).toBeUndefined();
+	});
+
+	it("anthropic route never leaves thinking disabled (silent-ignore hazard)", async () => {
+		withRouteSetting("anthropic");
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		// Level "off" maps to null in the 5.3 map: the branch must fall
+		// back to the lightest legal effort, NOT pass a disabled shape
+		// through (z.ai ignores it and bills max-depth thinking anyway).
+		const pi2 = { ...pi, getThinkingLevel: () => "off" } as unknown as TestPi;
+		await factory(pi2);
+		(ctx as { model: { api?: string } }).model = { provider: "zai", id: "glm-5.3", api: "anthropic-messages" };
+
+		const evt = { payload: { thinking: { type: "disabled" } } };
+		const out = handlers.before_provider_request(evt, ctx) as Record<string, any>;
+		expect(out.thinking).toEqual({ type: "enabled", reasoning_effort: "low" });
+	});
+
+	it("coding route is untouched by the anthropic branch (disabled rewrite still OpenAI-shaped)", async () => {
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		await factory(pi as unknown as TestPi);
+
+		const evt = { payload: { thinking: { type: "disabled", clear_thinking: false } } };
+		const out = handlers.before_provider_request(evt, ctx) as Record<string, any>;
+		expect(out.thinking).toEqual({ type: "enabled", clear_thinking: false });
+		expect(out.reasoning_effort).toBe("low");
+	});
+
+	it("route branch follows the registered model, not a concurrent settings flip", async () => {
+		// Cross-session hazard (peer-review finding): session A flips
+		// glm-api-route on disk while session B still runs a model registered
+		// as openai-completions. The request-shape branch must follow
+		// ctx.model.api, so B's next request keeps the coding shape.
+		withRouteSetting("anthropic");
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		await factory(pi as unknown as TestPi);
+		(ctx as { model: { api?: string } }).model = { provider: "zai", id: "glm-5.3", api: "openai-completions" };
+
+		const evt = { payload: { thinking: { type: "disabled", clear_thinking: false } } };
+		const out = handlers.before_provider_request(evt, ctx) as Record<string, any>;
+		// Coding-route safety net fired (OpenAI shape), NOT the anthropic
+		// replacement — despite anthropic being on disk.
+		expect(out.thinking).toEqual({ type: "enabled", clear_thinking: false });
+		expect(out.reasoning_effort).toBe("low");
+		expect(typeof out.thinking.reasoning_effort).toBe("undefined");
 	});
 });
