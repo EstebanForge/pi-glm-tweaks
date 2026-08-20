@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.4.1 — 2026-08-21
+
+### Changed
+- **`glm-budget-nudge` now defaults OFF** (user request): cache-neutral is
+  not behavior-neutral — the flag rewrites the system prompt for every
+  targeted GLM turn, so stock behavior is the safer default. All three
+  token-efficiency flags now default OFF; existing users who explicitly
+  toggled the flag keep their persisted choice (persisted-wins). Note for
+  upgraders whose 1.2.0-era toggle coincidentally matched the old default:
+  a persisted `true` still wins — run `/glm-tweaks glm-budget-nudge` once
+  to turn it off. Also documented: the nudge targets GLM-5.2's
+  overthinking loop and is not recommended for GLM-5.3+, whose
+  post-training already fixed it.
+- **Top thinking tier renamed from `xhigh` to `max`.** z.ai's wire values
+  for glm-5.2 and glm-5.3+ are `low | high | max`
+  ([docs](https://docs.z.ai/guides/llm/glm-5.3)), and Pi ships a native
+  `max` thinking level, so the picker, Shift+Tab cycling, and `/thinking`
+  now show `max` ("Maximum reasoning") for the deep-reasoning tier instead
+  of the misnamed `xhigh`.
+  - `xhigh` is now hidden (`null`) on every targeted GLM spec, exactly like
+    the other non-wire levels; `max: "max"` carries the wire value it
+    always had. Same bytes on the wire — display-only rename.
+  - The `model_select` auto-clamp now bumps to the nearest visible level at
+    or above the hidden one (mirroring pi-ai's `clampThinkingLevel`
+    up-first rule) instead of always landing on `high`: a session persisted
+    at `xhigh` upgrades to `max`, preserving its effort tier and wire
+    behavior across the upgrade.
+  - Footer chip, clamp notification, and the `/glm-tweaks` status line were
+    already wire-labeled (`max`), so they are unchanged.
+
+### Fixed
+- **Footer chip re-seeded on every `session_start`** (user-reported):
+  pi's interactive mode clears ALL extension footer statuses via
+  `resetExtensionUI()` on `/reload`, `/new`, and `/resume`, and
+  `model_select` does not re-fire when the model is unchanged — so the
+  chip vanished on session switch or after any `/glm-tweaks` toggle
+  reload until the next manual model switch. Both hooks now share
+  `updateFooterChips()`. Consolidated to ONE compact chip — `⇢ OAI` /
+  `⇢ ANT` (single-width monochrome glyph, U+21E2 ⇢ rightwards dashed arrow (verified in Iosevka Nerd Font Mono; earlier candidates U+26D7/U+26D5/🛣 are absent from mainstream terminal fonts), not a double-width emoji; the
+  symbol marks the chosen route), shown only while a targeted GLM
+  model is selected: the separate thinking-levels chip was redundant with
+  the model line's `• <level>` and the `/thinking` picker, and a single
+  entry keeps the extension-statuses footer line uncluttered. Inline
+  placement in the bottom-right model segment is not possible via the
+  extension API (`FooterComponent` hardcodes it).
+- **Anthropic-route fallback is now spec-aware** (peer-review finding):
+  an unmapped Pi level used to hardcode `reasoning_effort: "low"`, but
+  glm-5.2 does not document a `low` tier (wire: `high` | `max`) — a 5.2
+  session at level `off` on the anthropic route could send an undocumented
+  effort. The fallback (and the `glm-skip-short-thinking` anthropic path)
+  now uses the lightest effort the spec actually maps: 5.2 → `high`,
+  5.3 → `low`.
+- `nextVisibleLevel`'s unknown-level fallback now derives from the spec's
+  visible levels instead of returning a hardcoded `"high"`.
+
 ## 1.4.0 — 2026-08-19
 
 ### Added

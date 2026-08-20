@@ -34,7 +34,7 @@ function makePi(models: Array<{ provider: string; id: string }>) {
 			getAll: () => models,
 			getApiKeyForProvider: async () => "test-key",
 		},
-		ui: { notify: () => {} },
+		ui: { notify: () => {}, setStatus: () => {} },
 	};
 
 	return { pi, commands, handlers, state, ctx };
@@ -68,7 +68,8 @@ describe("pi-glm-tweaks extension entry", () => {
 			medium: null,
 			low: "low",
 			high: "high",
-			xhigh: "max",
+			xhigh: null,
+			max: "max",
 		});
 
 		// Untargeted models pass through untouched; 5.2 keeps its own map.
@@ -142,11 +143,35 @@ describe("pi-glm-tweaks extension entry", () => {
 				medium: null,
 				low: "low",
 				high: "high",
-				xhigh: "max",
+				xhigh: null,
+				max: "max",
 			});
 		}
 		// glm-5.1 predates the new contract: untouched, no fallback.
 		expect(models.find((x) => x.id === "glm-5.1")).toEqual({ provider: "zai", id: "glm-5.1" });
+	});
+
+	it("model_select clamps a stale xhigh up to max, not down to high", async () => {
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		const set: string[] = [];
+		const notes: string[] = []
+		const pi2 = {
+			...pi,
+			getThinkingLevel: () => "xhigh",
+			setThinkingLevel: (l: string) => void set.push(l),
+		} as unknown as TestPi;
+		(ctx as { ui: { notify: (m: string) => void; setStatus: () => void } }).ui = {
+			notify: (m: string) => void notes.push(m),
+			setStatus: () => {},
+		};
+		await factory(pi2);
+
+		handlers.model_select({ model: { provider: "zai", id: "glm-5.3" } }, ctx);
+
+		// xhigh was the pre-1.4.1 label for wire "max": the clamp must land on
+		// max (same wire effort) instead of silently halving to high.
+		expect(set).toEqual(["max"]);
+		expect(notes[0]).toContain('Switched to max');
 	});
 });
 
@@ -184,7 +209,29 @@ describe("glm-api-route setting", () => {
 		expect(glm53.thinkingLevelMap.high).toBe("high");
 	});
 
+	it("session_start re-seeds footer chips (survive /reload wipes)", async () => {
+		// Regression: pi's interactive mode clears ALL extension footer
+		// statuses on /reload, /new, /resume — and model_select does not
+		// re-fire when the model is unchanged. Chips must be re-set from
+		// session_start or they vanish until a manual model switch.
+		withRouteSetting("coding");
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		const statuses: Array<[string, string | undefined]> = [];
+		(ctx as { ui: unknown }).ui = {
+			notify: () => {},
+			setStatus: (key: string, text: string | undefined) => void statuses.push([key, text]),
+		};
+		await factory(pi as unknown as TestPi);
+		await handlers.session_start(undefined, ctx);
+
+		expect(statuses).toContainEqual(["glm", `${String.fromCodePoint(0x21e2)} OAI`]);
+	});
+
 	it("coding route (default) keeps the documented OpenAI-shape contract", async () => {
+		// Pin an empty settings file: without PI_CODING_AGENT_DIR this test
+		// would read the developer's real ~/.pi/agent/pi-glm-tweaks.json and
+		// fail whenever the host install has glm-api-route=anthropic.
+		withRouteSetting("coding");
 		const { pi, handlers, state, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
 		await factory(pi as unknown as TestPi);
 		await handlers.session_start(undefined, ctx);
@@ -200,7 +247,7 @@ describe("glm-api-route setting", () => {
 	it("anthropic route replaces Pi's budget-based thinking with enabled+reasoning_effort", async () => {
 		withRouteSetting("anthropic");
 		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
-		const pi2 = { ...pi, getThinkingLevel: () => "xhigh" } as unknown as TestPi;
+		const pi2 = { ...pi, getThinkingLevel: () => "max" } as unknown as TestPi;
 		await factory(pi2);
 		// The branch keys off the REGISTERED model's api field, mirroring
 		// what session_start built from the persisted route.
@@ -229,6 +276,22 @@ describe("glm-api-route setting", () => {
 		const evt = { payload: { thinking: { type: "disabled" } } };
 		const out = handlers.before_provider_request(evt, ctx) as Record<string, any>;
 		expect(out.thinking).toEqual({ type: "enabled", reasoning_effort: "low" });
+	});
+
+	it("anthropic route falls back to the lightest DOCUMENTED effort per spec (glm-5.2 off → high, not low)", async () => {
+		// Peer-review finding (v1.4.1): glm-5.2's map has no "off" key, so an
+		// unmapped level hit the hardcoded "low" fallback — an effort glm-5.2
+		// does not document (its wire tiers are high|max). The fallback must
+		// be spec-aware: 5.2 → high, 5.3 → low.
+		withRouteSetting("anthropic");
+		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.2" }]);
+		const pi2 = { ...pi, getThinkingLevel: () => "off" } as unknown as TestPi;
+		await factory(pi2);
+		(ctx as { model: { api?: string } }).model = { provider: "zai", id: "glm-5.2", api: "anthropic-messages" };
+
+		const evt = { payload: { thinking: { type: "enabled", budget_tokens: 4096 } } };
+		const out = handlers.before_provider_request(evt, ctx) as Record<string, any>;
+		expect(out.thinking).toEqual({ type: "enabled", reasoning_effort: "high" });
 	});
 
 	it("coding route is untouched by the anthropic branch (disabled rewrite still OpenAI-shaped)", async () => {

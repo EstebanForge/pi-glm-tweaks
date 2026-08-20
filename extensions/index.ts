@@ -16,7 +16,7 @@
  *     ----------|---------------|------------------
  *     off       | "disabled"    | (omitted)
  *     high      | "enabled"     | "high"
- *     xhigh     | "enabled"     | "max"
+ *     max       | "enabled"     | "max"
  *
  *   glm-5.3 / glm-5.3[1m] (thinking always on; thinking.type:"disabled"
  *   removed in 5.3 — direct API rejects it; migration is enabled +
@@ -26,11 +26,17 @@
  *     off       | "enabled"     | "low"   (enforced by the request-layer
  *     low       | "enabled"     | "low"    guard below, NOT the map — Pi's
  *     high      | "enabled"     | "high"   zai transport sends "disabled"
- *     xhigh     | "enabled"     | "max"    whenever effort is undefined)
+ *     max       | "enabled"     | "max"    whenever effort is undefined)
+ *
+ * The top tier is Pi's native `max` level, NOT `xhigh`: z.ai names its wire
+ * value "max" (docs.z.ai/guides/llm/glm-5.3), Pi ships a matching `max`
+ * level, and showing `xhigh` for wire "max" misnames the mode in the UI.
+ * `xhigh` is hidden like the other non-wire levels below.
  *
  * Hidden levels are Pi-side concepts that don't map cleanly to the wire
  * (5.2: low/medium map server-side to "high", minimal is a no-op for Pi's
- * reasoning transport; 5.3: minimal/medium have no wire counterpart).
+ * reasoning transport; 5.3: minimal/medium have no wire counterpart;
+ * both: xhigh has no distinct wire tier under max).
  * Showing them invites accidental footguns.
  *
  * Behavior:
@@ -42,8 +48,8 @@
  *     to a supported one and notify. Set the footer status hint.
  *   - On model_select to any other model, clear the footer status.
  *   - On every user turn, inject a soft system-prompt budget fragment
- *     (`glm-budget-nudge`, default OFF — rewrites the system prompt every
- *     turn, which drifts the cached prefix).
+ *     (`glm-budget-nudge`, default OFF — cache-safe but not behavior-
+ *     neutral; see FLAGS below).
  *   - Per LLM call, count cumulative reasoning_content; if over a
  *     threshold, inject a one-shot user-side hint to push the model back
  *     toward tool calls (`glm-budget-nudge`).
@@ -108,18 +114,18 @@ interface GlmSpec {
 const MODEL_SPECS: Record<string, GlmSpec> = {
 	"glm-5.2": {
 		name: "GLM-5.2",
-		thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: "max" },
+		thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
 		canDisableThinking: true,
 	},
 	"glm-5.3": {
 		name: "GLM-5.3",
-		thinkingLevelMap: { off: "low", minimal: null, medium: null, low: "low", high: "high", xhigh: "max" },
+		thinkingLevelMap: { off: "low", minimal: null, medium: null, low: "low", high: "high", xhigh: null, max: "max" },
 		canDisableThinking: false,
 	},
 	// 1M-context Coding Plan route (same model, bigger window).
 	"glm-5.3[1m]": {
 		name: "GLM-5.3 (1M)",
-		thinkingLevelMap: { off: "low", minimal: null, medium: null, low: "low", high: "high", xhigh: "max" },
+		thinkingLevelMap: { off: "low", minimal: null, medium: null, low: "low", high: "high", xhigh: null, max: "max" },
 		canDisableThinking: false,
 	},
 };
@@ -148,7 +154,10 @@ function resolveSpec(id: string): GlmSpec | undefined {
 }
 
 // Pi thinking levels hidden in the UI for a spec: every map entry mapped to
-// null. Listed explicitly in the map so it stays grep-friendly.
+// null. Listed explicitly in the map so it stays grep-friendly. Note: keys
+// merely ABSENT from the map (5.2's "off") are treated as visible by Pi,
+// not hidden — absence means "wired elsewhere" (the zai transport sends
+// thinking.type="disabled" for it), not "unsupported".
 function hiddenLevels(spec: GlmSpec): Set<string> {
 	return new Set(Object.entries(spec.thinkingLevelMap).filter(([, v]) => v === null).map(([k]) => k));
 }
@@ -162,25 +171,58 @@ function wireLabels(spec: GlmSpec): string[] {
 	return [...labels];
 }
 
+// Pi's canonical thinking-level ladder, low -> high.
+const PI_LEVEL_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+// Clamp target for a hidden level: the nearest VISIBLE level at or above
+// the requested one (then below, if none above exists). Mirrors pi-ai's
+// clampThinkingLevel up-first semantics: a stale `xhigh` (the pre-1.4.1
+// label for wire "max") lands on `max`, not `high`, so upgrades don't
+// silently halve the user's effort tier; `minimal`/`medium` bump to the
+// next wire-real level.
+function nextVisibleLevel(spec: GlmSpec, level: string): (typeof PI_LEVEL_ORDER)[number] {
+	const visible = (l: string) => spec.thinkingLevelMap[l] !== null && spec.thinkingLevelMap[l] !== undefined;
+	const idx = PI_LEVEL_ORDER.indexOf(level as (typeof PI_LEVEL_ORDER)[number]);
+	if (idx === -1) {
+		// Unknown level string: clamp up from the bottom of the ladder so the
+		// fallback is itself a visible level, never a hardcoded name.
+		for (let i = 0; i < PI_LEVEL_ORDER.length; i++) if (visible(PI_LEVEL_ORDER[i])) return PI_LEVEL_ORDER[i];
+		return "high"; // unreachable: every spec maps at least one level
+	}
+	for (let i = idx; i < PI_LEVEL_ORDER.length; i++) if (visible(PI_LEVEL_ORDER[i])) return PI_LEVEL_ORDER[i];
+	for (let i = idx - 1; i >= 0; i--) if (visible(PI_LEVEL_ORDER[i])) return PI_LEVEL_ORDER[i];
+	return "high"; // unreachable: every spec maps at least one level
+}
+
+// Lightest wire effort a spec documents: the first non-null value in the
+// spec's map (insertion order runs light -> heavy: 5.2 high|max, 5.3
+// low|high|max). NOT a hardcoded "low" — glm-5.2 does not document a "low"
+// effort, so the anthropic-route fallback below must not invent one.
+function lightestEffort(spec: GlmSpec): string {
+	for (const v of Object.values(spec.thinkingLevelMap)) if (v !== null) return v;
+	return "low"; // unreachable: every spec maps at least one effort
+}
+
 // Token-efficiency tuning constant. Hardcoded for v1 — exposed as a flag
 // would be over-engineering for a single-model extension.
 const SHORT_PROMPT_THRESHOLD = 80;
 
 // Token-efficiency flags. Single source of truth — drives registerFlag,
 // the /glm-tweaks status display, autocomplete, and the toggle subcommand.
-// glm-budget-nudge defaults ON (cache-safe: it appends a fixed fragment to
-// the system prompt, so the prefix stays byte-identical turn to turn and the
-// z.ai server cache is reused). The other two default OFF because they
-// undermine the coding endpoint's Preserved Thinking caching
-// (see docs.z.ai/guides/capabilities/thinking-mode). Users who want them can
-// opt in via /glm-tweaks.
+// All three default OFF since 1.4.1: glm-budget-nudge is cache-safe (it
+// appends a fixed fragment, so the prefix stays byte-identical turn to
+// turn and the z.ai server cache is reused) but NOT behavior-neutral — it
+// rewrites the system prompt for every GLM turn; glm-clear-thinking and
+// glm-skip-short-thinking additionally undermine the coding endpoint's
+// Preserved Thinking caching (see docs.z.ai/guides/capabilities/thinking-
+// mode). Users who want any of them opt in via /glm-tweaks.
 const FLAGS = [
 	{
 		name: "glm-budget-nudge",
 		label: "Budget nudge",
-		default: true,
+		default: false,
 		description:
-			"Append a constant thinking-budget fragment to the system prompt on every targeted zai GLM turn (glm-5.2, glm-5.3, glm-5.3[1m]), steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet appended a reactive hint message after the last tool result; the hint sat between the cached prefix and the model's next turn, displacing that turn from the cache and forcing a one-time re-ingest. It fired precisely when reasoning was largest, so it is gone.)",
+			"Append a constant thinking-budget fragment to the system prompt on every targeted zai GLM turn (glm-5.2, glm-5.3, glm-5.3[1m]), steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. Defaults OFF since 1.4.1: cache-neutral is not behavior-neutral — it still rewrites the system prompt for every GLM turn, so stock behavior is the safer default and users who want the nudge opt in. Meant for GLM-5.2's overthinking loop; not recommended for GLM-5.3 or greater, whose post-training already fixed the overthinking (fewer output tokens per task at every effort level). (The earlier mid-loop ratchet appended a reactive hint message after the last tool result; the hint sat between the cached prefix and the model's next turn, displacing that turn from the cache and forcing a one-time re-ingest. It fired precisely when reasoning was largest, so it is gone.)",
 	},
 	{
 		name: "glm-clear-thinking",
@@ -486,6 +528,42 @@ export default function (pi: ExtensionAPI) {
 		shortPrompt: boolean;
 	} = { shortPrompt: false };
 
+	// ── Footer chips ────────────────────────────────────────────────────
+	// "glm": one compact chip showing the active API route — ⛕ OAI
+	// (coding / OpenAI Chat Completions) or ⛕ ANT (Anthropic
+	// Messages) — only while a TARGETED GLM model is selected; the chip is
+	// cleared for every other model (non-GLM providers and untargeted zai
+	// entries like glm-4.7, which keep their own baseUrl — showing a route
+	// there would be misleading). Display only — the authoritative
+	// per-request decision reads ctx.model.api, so a stale chip can mislead
+	// but never miswire.
+	//
+	// Set from TWO hooks, not just model_select: pi's interactive mode calls
+	// resetExtensionUI() (which CLEARS all extension footer statuses) on
+	// /reload, /new, and /resume — and model_select does not re-fire after
+	// those when the model is unchanged, so chips set only there vanished
+	// until the next manual model switch. session_start fires after every
+	// reload/session switch, making the pair cover all transitions:
+	//   - session_start: startup, /new, /resume, /reload (incl. the
+	//     /glm-tweaks toggle/route reload itself).
+	//   - model_select: model switches, incl. restore; also the clear path
+	//     for non-targeted models.
+	// Chip glyph: U+21E2 (⇢, rightwards dashed arrow — the user's pick;
+// verified present in Iosevka Nerd Font Mono's cmap). Earlier candidates
+// failed on font coverage: the traffic symbols (U+26D7, U+26D5) and the
+// road emoji are absent from Iosevka and every mainstream terminal font,
+// so they render as tofu. Built via fromCodePoint because the literal is
+// easy to corrupt in edits.
+const ROUTE_GLYPH = String.fromCodePoint(0x21e2);
+
+const updateFooterChips = (model: { provider: string; id: string } | undefined | null, ui: { setStatus: (key: string, text: string | undefined) => void }) => {
+		if (specFor(model) === undefined) {
+			ui.setStatus("glm", undefined);
+			return;
+		}
+		ui.setStatus("glm", `${ROUTE_GLYPH} ${resolveRoute() === "anthropic" ? "ANT" : "OAI"}`);
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		// Build the full `zai` provider model list, patching only targeted GLM
 		// models. registerProvider replaces ALL models for the provider when models
@@ -527,6 +605,13 @@ export default function (pi: ExtensionAPI) {
 			apiKey,
 			models,
 		});
+
+		// Re-seed the footer chips for this session (see updateFooterChips:
+		// session_start is the only hook that runs after a /reload clears
+		// them). Placed last so an early return above (no zai models, no
+		// targeted model, no auth) leaves the chips untouched-or-cleared by
+		// the model_select path instead of asserting a dead provider.
+		updateFooterChips(ctx.model, ctx.ui);
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
@@ -573,14 +658,17 @@ export default function (pi: ExtensionAPI) {
 			const level = pi.getThinkingLevel();
 			let effort = spec.thinkingLevelMap[level];
 			if (effort === null || effort === undefined) {
-				// Hidden or unmapped level ("off" maps to null on 5.3): use the
-			// lightest legal effort, matching the coding-route safety net.
-				effort = "low";
+				// Hidden or unmapped level: glm-5.2 has no "off" key (its off is
+				// thinking.type="disabled", unwirable on this route — z.ai's
+				// anthropic endpoint silently ignores "disabled"), and 5.3 maps
+				// minimal/medium/xhigh to null. Fall back to the lightest effort
+				// the spec actually documents (5.2: high, 5.3: low).
+				effort = lightestEffort(spec);
 			}
 			// Short-prompt skip generalizes to the anthropic route: same
-			// lightest-effort outcome as the coding branch below.
+			// lightest-documented-effort outcome as the coding branch below.
 			if (pi.getFlag("glm-skip-short-thinking") === true && loop.shortPrompt) {
-				effort = "low";
+				effort = lightestEffort(spec);
 			}
 			obj.thinking = { type: "enabled", reasoning_effort: effort };
 			return obj;
@@ -650,8 +738,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("model_select", (event, ctx) => {
 		const spec = specFor(event.model);
 		if (spec === undefined) {
-			ctx.ui.setStatus("glm-thinking", undefined);
-			ctx.ui.setStatus("glm-route", undefined);
+			updateFooterChips(event.model, ctx.ui);
 			return;
 		}
 
@@ -659,19 +746,16 @@ export default function (pi: ExtensionAPI) {
 		// setThinkingLevel is a no-op if already at the requested level.
 		const current = pi.getThinkingLevel();
 		if (hiddenLevels(spec).has(current)) {
-			pi.setThinkingLevel("high");
+			const clamped = nextVisibleLevel(spec, current);
+			pi.setThinkingLevel(clamped);
 			ctx.ui.notify(
-				`${event.model.id} thinking: "${current}" not supported. Switched to high (${wireLabels(spec).join(" | ")}).`,
+				`${event.model.id} thinking: "${current}" not supported. Switched to ${clamped} (${wireLabels(spec).join(" | ")}).`,
 				"info",
 			);
 		}
 
-		ctx.ui.setStatus("glm-thinking", `thinking: ${wireLabels(spec).join(" | ")}`);
-		// Separate footer chip for the active API route (OAI = coding / OpenAI
-		// Chat Completions, ANT = Anthropic Messages). Display only — the
-		// authoritative per-request decision reads ctx.model.api, so a stale
-		// chip can mislead but never miswire. Refreshed on every model_select,
-		// which re-fires after each /glm-tweaks route reload.
-		ctx.ui.setStatus("glm-route", resolveRoute() === "anthropic" ? "ANT" : "OAI");
+		// event.model is the newly selected model; ctx.model lags until the
+		// event completes, so pass the event's model explicitly.
+		updateFooterChips(event.model, ctx.ui);
 	});
 }

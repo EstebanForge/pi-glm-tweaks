@@ -20,7 +20,7 @@ Works with Pi's built-in `zai/glm-5.2` / `zai/glm-5.3` entries out of the box, o
 | --- | --- |
 | `off` | `thinking: { type: "disabled" }` |
 | `high` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` |
-| `max` (Pi `xhigh`) | `thinking: { type: "enabled" }` + `reasoning_effort: "max"` |
+| `max` | `thinking: { type: "enabled" }` + `reasoning_effort: "max"` |
 
 **glm-5.3 / glm-5.3[1m]** changed the contract (see the [GLM-5.3 launch](https://z.ai/blog/glm-5.3) and [docs](https://docs.z.ai/devpack/latest-model)): thinking is always on (`thinking.type: "disabled"` is rejected), and the wire levels are `low | high | max` with `max` the default:
 
@@ -29,9 +29,9 @@ Works with Pi's built-in `zai/glm-5.2` / `zai/glm-5.3` entries out of the box, o
 | `off` | `thinking: { type: "enabled" }` + `reasoning_effort: "low"` |
 | `low` | `thinking: { type: "enabled" }` + `reasoning_effort: "low"` |
 | `high` | `thinking: { type: "enabled" }` + `reasoning_effort: "high"` |
-| `max` (Pi `xhigh`) | `thinking: { type: "enabled" }` + `reasoning_effort: "max"` |
+| `max` | `thinking: { type: "enabled" }` + `reasoning_effort: "max"` |
 
-Pi natively exposes six thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`). Neither model fits all six — on 5.2, `low`/`medium` get mapped to `high` server-side and `minimal` is a no-op; on 5.3, `minimal`/`medium` have no wire counterpart and `off` maps to `low` (z.ai's documented migration for the removed `disabled` type).
+Pi natively exposes seven thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Neither model fits all seven — on 5.2, `low`/`medium` get mapped to `high` server-side and `minimal` is a no-op; on 5.3, `minimal`/`medium` have no wire counterpart and `off` maps to `low` (z.ai's documented migration for the removed `disabled` type). `xhigh` is hidden on both: z.ai's top wire tier is named `max` ([GLM-5.3 docs](https://docs.z.ai/guides/llm/glm-5.3): `low` / `high` / `max`) and Pi ships a native `max` level, so the picker shows `max` for the deep-reasoning tier instead of the misnamed `xhigh`.
 
 This extension collapses that mismatch:
 
@@ -42,7 +42,8 @@ This extension collapses that mismatch:
      low: null,      // hidden
      medium: null,   // hidden
      high:   "high", // → reasoning_effort: "high"
-     xhigh:  "max",  // → reasoning_effort: "max"
+     xhigh:  null,   // hidden (wire tier is named max; Pi has a native max level)
+     max:    "max",  // → reasoning_effort: "max"
      // off omitted → supported, sends thinking.type = "disabled"
    }
    ```
@@ -54,11 +55,12 @@ This extension collapses that mismatch:
      medium: null,   // hidden
      low:     "low", // → reasoning_effort: "low" (new real wire level in 5.3)
      high:   "high", // → reasoning_effort: "high"
-     xhigh:  "max",  // → reasoning_effort: "max"
+     xhigh:  null,   // hidden (wire tier is named max; Pi has a native max level)
+     max:    "max",  // → reasoning_effort: "max"
    }
    ```
-2. **Auto-clamps on `model_select`** — if the current level is one we hid (e.g. you switched from a model that allowed `medium`), quietly bump to `high` and notify.
-3. **Footer hint** — sets `ctx.ui.setStatus("glm-thinking", ...)` to the active model's wire levels (`off | high | max` on 5.2, `low | high | max` on 5.3) while a targeted model is active.
+2. **Auto-clamps on `model_select`** — if the current level is one we hid (e.g. you switched from a model that allowed `medium`), bump to the nearest visible level at or above it (a stale `xhigh`, the old label for wire `max`, lands on `max`) and notify.
+3. **Footer chip** — one compact status while a targeted GLM model is selected: `⇢ OAI` (coding / OpenAI Chat Completions) or `⇢ ANT` (Anthropic Messages), rendered on the extension-statuses line of the footer; cleared for every other model. The glyph is a single-width monochrome symbol (U+21E2 ⇢, verified present in Iosevka Nerd Font Mono), not an emoji — emoji render double-width in most terminals and can shift the footer line. It is re-seeded on every `session_start` — pi's interactive mode clears ALL extension footer statuses on `/reload`, `/new`, and `/resume`, and `model_select` does not re-fire when the model is unchanged, so setting it only on model selection made the chip vanish until the next manual model switch. (Inline placement in the bottom-right model segment is not possible: `FooterComponent` hardcodes that side; extensions can only append status lines or replace the whole footer.)
 4. **`/glm-tweaks` command** — status panel + flag toggle from inside Pi (see [`/glm-tweaks` command](#glm-tweaks-command)).
 
 `Shift+Tab`, `/thinking`, and the level picker all see only the supported modes for the selected model.
@@ -67,11 +69,13 @@ This extension collapses that mismatch:
 
 GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reasoning_content` without taking a tool call. The Z.AI API does not expose a `max_thinking_tokens` parameter, so the post that popularised this observation does it at the provider layer (mid-stream injection). We can't intercept the stream, but we can approximate the win with three opt-in tweaks.
 
-**Two of the three default OFF; `glm-budget-nudge` defaults ON.** Per [docs.z.ai Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode), Preserved Thinking (`clear_thinking: false`) is **on by default on the coding endpoint** precisely because it "increases cache hit rates — saving tokens in real tasks." The budget nudge keeps that property (it appends a fixed fragment, so the prefix stays byte-stable); `glm-clear-thinking` and `glm-skip-short-thinking` do not, so they stay opt-in for users who have measured that thinking tokens, not cache misses, are their real cost driver.
+**`glm-budget-nudge` is a GLM-5.2 remedy and is not recommended for GLM-5.3 or greater.** Z.AI's post-training for 5.3 addressed the overthinking loop ([docs](https://docs.z.ai/guides/llm/glm-5.3): fewer output tokens per task at every effort level than 5.2), so on 5.3+ the fragment only fights the model's tuned behavior. It is not model-gated — if you enable it, it applies to every targeted GLM turn — so leave it off unless you are running 5.2 and seeing the loop.
+
+**All three default OFF (since 1.4.1).** `glm-budget-nudge` is cache-safe — per [docs.z.ai Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode), Preserved Thinking (`clear_thinking: false`) is **on by default on the coding endpoint** because it "increases cache hit rates — saving tokens in real tasks," and the nudge's fixed fragment keeps the prefix byte-stable — but cache-neutral is not behavior-neutral: it rewrites the system prompt on every GLM turn. `glm-clear-thinking` and `glm-skip-short-thinking` additionally undermine Preserved Thinking caching. Stock behavior is the safest default; opt in per flag once you have measured that thinking tokens, not cache misses, are your cost driver.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `glm-budget-nudge` | `true` | Appends a constant thinking-budget fragment to the system prompt on every zai/glm-5.2 turn, steering the model toward committing to a tool call before it spirals into overthinking. **Cache:** safe — the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet appended a reactive `[system reminder: ...]` message after the last tool result; that hint sat between the cached prefix and the model's next turn, displacing it from the cache and forcing a one-time re-ingest. It fired when reasoning was largest, so it is gone.) |
+| `glm-budget-nudge` | `false` | Appends a constant thinking-budget fragment to the system prompt on every targeted zai GLM turn, steering the model toward committing to a tool call before it spirals into overthinking. Meant for GLM-5.2's overthinking loop; not recommended for GLM-5.3+, whose post-training already fixed it. **Cache:** safe — the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet appended a reactive `[system reminder: ...]` message after the last tool result; that hint sat between the cached prefix and the model's next turn, displacing it from the cache and forcing a one-time re-ingest. It fired when reasoning was largest, so it is gone.) |
 | `glm-clear-thinking` | `false` | Forces `clear_thinking: true` on every request, opting out of z.ai Preserved Thinking. Preserved Thinking is the coding endpoint's default and is what keeps the prefix byte-stable across turns (so it caches). Disabling it re-bills the full prefix every turn — usually a net loss. |
 | `glm-skip-short-thinking` | `false` | For user prompts under 80 chars, uses the lightest thinking mode for that turn: `thinking.type: "disabled"` on 5.2, `thinking.type: "enabled"` + `reasoning_effort: "low"` on 5.3 (which rejects `disabled`). **Cache:** toggling thinking intensity across turns based on prompt length changes the reasoning_content sequence z.ai caches, so follow-up turns on the same session re-bill instead of hitting the cached prefix. |
 
