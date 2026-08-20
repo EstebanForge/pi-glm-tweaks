@@ -60,7 +60,7 @@ This extension collapses that mismatch:
    }
    ```
 2. **Auto-clamps on `model_select`** — if the current level is one we hid (e.g. you switched from a model that allowed `medium`), bump to the nearest visible level at or above it (a stale `xhigh`, the old label for wire `max`, lands on `max`) and notify.
-3. **Footer chip** — one compact status while a targeted GLM model is selected: `⇢ OAI` (coding / OpenAI Chat Completions) or `⇢ ANT` (Anthropic Messages), rendered on the extension-statuses line of the footer; cleared for every other model. The glyph is a single-width monochrome symbol (U+21E2 ⇢, verified present in Iosevka Nerd Font Mono), not an emoji — emoji render double-width in most terminals and can shift the footer line. It is re-seeded on every `session_start` — pi's interactive mode clears ALL extension footer statuses on `/reload`, `/new`, and `/resume`, and `model_select` does not re-fire when the model is unchanged, so setting it only on model selection made the chip vanish until the next manual model switch. (Inline placement in the bottom-right model segment is not possible: `FooterComponent` hardcodes that side; extensions can only append status lines or replace the whole footer.)
+3. **Footer chip** — one compact status while a targeted GLM model is selected: `⇢ OAI` (either OpenAI Chat Completions route: coding plan or api usage) or `⇢ ANT` (Anthropic Messages), rendered on the extension-statuses line of the footer; cleared for every other model. The glyph is a single-width monochrome symbol (U+21E2 ⇢, verified present in Iosevka Nerd Font Mono), not an emoji — emoji render double-width in most terminals and can shift the footer line. It is re-seeded on every `session_start` — pi's interactive mode clears ALL extension footer statuses on `/reload`, `/new`, and `/resume`, and `model_select` does not re-fire when the model is unchanged, so setting it only on model selection made the chip vanish until the next manual model switch. (Inline placement in the bottom-right model segment is not possible: `FooterComponent` hardcodes that side; extensions can only append status lines or replace the whole footer.)
 4. **`/glm-tweaks` command** — status panel + flag toggle from inside Pi (see [`/glm-tweaks` command](#glm-tweaks-command)).
 
 `Shift+Tab`, `/thinking`, and the level picker all see only the supported modes for the selected model.
@@ -71,7 +71,7 @@ GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reaso
 
 **`glm-budget-nudge` is a GLM-5.2 remedy and is not recommended for GLM-5.3 or greater.** Z.AI's post-training for 5.3 addressed the overthinking loop ([docs](https://docs.z.ai/guides/llm/glm-5.3): fewer output tokens per task at every effort level than 5.2), so on 5.3+ the fragment only fights the model's tuned behavior. It is not model-gated — if you enable it, it applies to every targeted GLM turn — so leave it off unless you are running 5.2 and seeing the loop.
 
-**All three default OFF (since 1.4.1).** `glm-budget-nudge` is cache-safe — per [docs.z.ai Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode), Preserved Thinking (`clear_thinking: false`) is **on by default on the coding endpoint** because it "increases cache hit rates — saving tokens in real tasks," and the nudge's fixed fragment keeps the prefix byte-stable — but cache-neutral is not behavior-neutral: it rewrites the system prompt on every GLM turn. `glm-clear-thinking` and `glm-skip-short-thinking` additionally undermine Preserved Thinking caching. Stock behavior is the safest default; opt in per flag once you have measured that thinking tokens, not cache misses, are your cost driver.
+**All three default OFF (since 1.5.0).** `glm-budget-nudge` is cache-safe — per [docs.z.ai Thinking Mode](https://docs.z.ai/guides/capabilities/thinking-mode), Preserved Thinking (`clear_thinking: false`) is **on by default on the coding endpoint** because it "increases cache hit rates — saving tokens in real tasks," and the nudge's fixed fragment keeps the prefix byte-stable — but cache-neutral is not behavior-neutral: it rewrites the system prompt on every GLM turn. `glm-clear-thinking` and `glm-skip-short-thinking` additionally undermine Preserved Thinking caching. Stock behavior is the safest default; opt in per flag once you have measured that thinking tokens, not cache misses, are your cost driver.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
@@ -91,7 +91,7 @@ An in-session command for inspecting and flipping the flags above without leavin
 | `/glm-tweaks` (non-TUI / RPC) | Falls back to a read-only status panel (active model, thinking level vs the `off \| high \| max` map, and each flag's on/off state). |
 | `/glm-tweaks toggle <flag>` | One-shot flip: persists, then reloads. |
 | `/glm-tweaks <flag>` | Shorthand one-shot toggle (flag name without the `toggle` keyword). |
-| `/glm-tweaks route <coding\|anthropic>` | Switch the z.ai API route for targeted GLM models: persists, then reloads. |
+| `/glm-tweaks route <coding\|api\|anthropic>` | Switch the z.ai API route for targeted GLM models (full labels like `openai (coding plan)` also accepted): persists, then reloads. |
 
 The command offers tab-completion for `toggle` and the three flag names.
 
@@ -106,14 +106,15 @@ The command offers tab-completion for `toggle` and the three flag names.
 
 ## API route selection
 
-Z.AI's GLM Coding Plan accepts the same key and the same credit billing on two protocols ([docs](https://docs.z.ai/devpack/quick-start)):
+Three z.ai endpoints, two billing worlds ([docs](https://docs.z.ai/devpack/quick-start), [thinking mode](https://docs.z.ai/guides/capabilities/thinking-mode)):
 
-| Route | Endpoint | Caching | Thinking |
-| --- | --- | --- | --- |
-| `coding` (default) | `https://api.z.ai/api/coding/paas/v4` (OpenAI Chat Completions) | Implicit server-side prefix caching (Preserved Thinking keeps the prefix byte-identical) | `thinking.type` + `reasoning_effort`, z.ai's documented contract |
-| `anthropic` | `https://api.z.ai/api/anthropic` (Anthropic Messages) | Explicit `cache_control` breakpoints (Pi marks system, last tool, last message; verified: a repeated ~122k-token prefix read 122,560 tokens from cache) | `thinking: {type: "enabled", reasoning_effort}` translated per-request by this extension |
+| Route | Endpoint | Billing | Caching | Thinking |
+| --- | --- | --- | --- | --- |
+| `openai (coding plan)` (default) | `https://api.z.ai/api/coding/paas/v4` (OpenAI Chat Completions) | Coding Plan credits/points | Implicit server-side prefix caching (Preserved Thinking keeps the prefix byte-identical) | `thinking.type` + `reasoning_effort`, z.ai's documented contract |
+| `openai (api usage)` | `https://api.z.ai/api/paas/v4` (OpenAI Chat Completions) | Per token, standard z.ai API key | Preserved Thinking defaults OFF server-side, but Pi sends `clear_thinking: false` explicitly and replays `reasoning_content` verbatim, so the cache posture matches the coding route | Same contract as coding |
+| `anthropic` | `https://api.z.ai/api/anthropic` (Anthropic Messages) | Coding Plan credits | Explicit `cache_control` breakpoints (Pi marks system, last tool, last message; verified: a repeated ~122k-token prefix read 122,560 tokens from cache) | `thinking: {type: "enabled", reasoning_effort}` translated per-request by this extension |
 
-Switch with `/glm-tweaks route anthropic` (or from the interactive menu). Notes:
+The persisted setting keeps the short keys (`coding` | `api` | `anthropic`) for backward compatibility; the labels above are what the settings menu and completions show. Switch with `/glm-tweaks route <key or label>` (or from the interactive menu). **Key caveat for `openai (api usage)`**: z.ai keys are not interchangeable — a Coding Plan key will not bill against the standard API and vice versa, so make sure the configured `zai` provider key matches the route you pick. Notes:
 
 - **Usage display**: the Anthropic route reports `cache_read_input_tokens` but no `cache_creation_input_tokens`, so Pi's cache-write column reads 0 there. The cached tokens still bill at the discounted rate.
 - **Mid-conversation switching** is supported but prior turns' reasoning replays as plain text (Pi's Anthropic provider degrades thinking blocks without signatures on replay). Start a fresh session for a clean A/B.

@@ -74,24 +74,39 @@ import { loadFlagSettings, loadStringSettings, saveSetting } from "../lib/flag-s
 const PROVIDER = "zai";
 const ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
+const ZAI_API_BASE_URL = "https://api.z.ai/api/paas/v4";
 
-// API route setting. Both routes are first-class GLM Coding Plan endpoints
-// with identical credit billing (docs.z.ai/devpack/quick-start):
-//   - "coding" (default): OpenAI Chat Completions at /api/coding/paas/v4.
-//     Implicit server-side prefix caching; our thinking contract
-//     (thinking.type + reasoning_effort + clear_thinking) is the documented
-//     z.ai shape on this route.
-//   - "anthropic": Anthropic Messages at /api/anthropic. Pi's Anthropic
-//     provider applies cache_control breakpoints (probed 2026-08-19: 122k/
-//     122k cached-token read on a repeated prefix, so caching is confirmed).
-//     Thinking needs a different translation (see before_provider_request).
-type ApiRoute = "coding" | "anthropic";
-const ROUTE_VALUES: ApiRoute[] = ["coding", "anthropic"];
+// API route setting. Three z.ai endpoints, two billing worlds
+// (docs.z.ai/devpack/quick-start + docs.z.ai/guides/capabilities/thinking-mode):
+//   - "coding" (default): GLM Coding Plan, OpenAI Chat Completions at
+//     /api/coding/paas/v4. Billed in plan credits/points. Implicit
+//     server-side prefix caching; Preserved Thinking ON by default.
+//   - "api": standard z.ai platform API, OpenAI Chat Completions at
+//     /api/paas/v4. Billed per token against a standard API key (NOT the
+//     Coding Plan key — z.ai keys are not interchangeable). Same thinking
+//     contract; Preserved Thinking defaults OFF there, but Pi's zai
+//     transport sends clear_thinking:false explicitly and replays
+//     reasoning_content verbatim, so the cache posture matches coding.
+//   - "anthropic": GLM Coding Plan, Anthropic Messages at /api/anthropic
+//     (plan credits, like coding). Pi's Anthropic provider applies
+//     cache_control breakpoints (probed 2026-08-19: 122k/122k cached-token
+//     read on a repeated prefix). Thinking needs a different translation
+//     (see before_provider_request).
+// Persisted value is the short key ("coding" | "api" | "anthropic") for
+// backward compatibility with pre-existing settings files; the human-readable
+// labels below are display-only (settings menu, /glm-tweaks, footer chip).
+type ApiRoute = "coding" | "api" | "anthropic";
+const ROUTE_VALUES: ApiRoute[] = ["coding", "api", "anthropic"];
+const ROUTE_LABELS: Record<ApiRoute, string> = {
+	coding: "openai (coding plan)",
+	api: "openai (api usage)",
+	anthropic: "anthropic",
+};
 const ROUTE_SETTING = "glm-api-route";
 
 function resolveRoute(): ApiRoute {
 	const persisted = loadStringSettings()[ROUTE_SETTING];
-	return persisted === "anthropic" ? "anthropic" : "coding";
+	return persisted === "anthropic" || persisted === "api" ? persisted : "coding";
 }
 
 // Per-model tweaks table. One entry per targeted zai model id; everything
@@ -176,7 +191,7 @@ const PI_LEVEL_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max
 
 // Clamp target for a hidden level: the nearest VISIBLE level at or above
 // the requested one (then below, if none above exists). Mirrors pi-ai's
-// clampThinkingLevel up-first semantics: a stale `xhigh` (the pre-1.4.1
+// clampThinkingLevel up-first semantics: a stale `xhigh` (the pre-1.5.0
 // label for wire "max") lands on `max`, not `high`, so upgrades don't
 // silently halve the user's effort tier; `minimal`/`medium` bump to the
 // next wire-real level.
@@ -209,7 +224,7 @@ const SHORT_PROMPT_THRESHOLD = 80;
 
 // Token-efficiency flags. Single source of truth — drives registerFlag,
 // the /glm-tweaks status display, autocomplete, and the toggle subcommand.
-// All three default OFF since 1.4.1: glm-budget-nudge is cache-safe (it
+// All three default OFF since 1.5.0: glm-budget-nudge is cache-safe (it
 // appends a fixed fragment, so the prefix stays byte-identical turn to
 // turn and the z.ai server cache is reused) but NOT behavior-neutral — it
 // rewrites the system prompt for every GLM turn; glm-clear-thinking and
@@ -222,7 +237,7 @@ const FLAGS = [
 		label: "Budget nudge",
 		default: false,
 		description:
-			"Append a constant thinking-budget fragment to the system prompt on every targeted zai GLM turn (glm-5.2, glm-5.3, glm-5.3[1m]), steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. Defaults OFF since 1.4.1: cache-neutral is not behavior-neutral — it still rewrites the system prompt for every GLM turn, so stock behavior is the safer default and users who want the nudge opt in. Meant for GLM-5.2's overthinking loop; not recommended for GLM-5.3 or greater, whose post-training already fixed the overthinking (fewer output tokens per task at every effort level). (The earlier mid-loop ratchet appended a reactive hint message after the last tool result; the hint sat between the cached prefix and the model's next turn, displacing that turn from the cache and forcing a one-time re-ingest. It fired precisely when reasoning was largest, so it is gone.)",
+			"Append a constant thinking-budget fragment to the system prompt on every targeted zai GLM turn (glm-5.2, glm-5.3, glm-5.3[1m]), steering the model toward committing to a tool call before overthinking. Cache-safe: the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. Defaults OFF since 1.5.0: cache-neutral is not behavior-neutral — it still rewrites the system prompt for every GLM turn, so stock behavior is the safer default and users who want the nudge opt in. Meant for GLM-5.2's overthinking loop; not recommended for GLM-5.3 or greater, whose post-training already fixed the overthinking (fewer output tokens per task at every effort level). (The earlier mid-loop ratchet appended a reactive hint message after the last tool result; the hint sat between the cached prefix and the model's next turn, displacing that turn from the cache and forcing a one-time re-ingest. It fired precisely when reasoning was largest, so it is gone.)",
 	},
 	{
 		name: "glm-clear-thinking",
@@ -276,11 +291,14 @@ You are operating under a per-turn thinking budget. Behave accordingly:
 //     working shape.
 function buildGlmModel(id: string, spec: GlmSpec, route: ApiRoute) {
 	const anthropic = route === "anthropic";
+	// "api" and "coding" share the OpenAI Chat Completions contract
+	// (thinking shape, reasoning_effort, zai tool streaming); only the
+	// baseUrl (and who bills you) differs.
 	return {
 		id,
 		name: spec.name,
 		api: anthropic ? "anthropic-messages" : "openai-completions",
-		baseUrl: anthropic ? ZAI_ANTHROPIC_BASE_URL : ZAI_CODING_BASE_URL,
+		baseUrl: anthropic ? ZAI_ANTHROPIC_BASE_URL : route === "api" ? ZAI_API_BASE_URL : ZAI_CODING_BASE_URL,
 		reasoning: true,
 		input: ["text"] as ("text" | "image")[],
 		contextWindow: 1_000_000,
@@ -320,13 +338,13 @@ function renderStatus(
 	return [
 		`GLM tweaks — ${active ? `ACTIVE (${model!.provider}/${model!.id} selected)` : "inactive (select zai/glm-5.2, zai/glm-5.3, or a newer glm-5.x)"}`,
 		`thinking: ${active ? `current=${level}, wire=${wireLabels(spec!).join("|")}` : "n/a"}`,
-		`api route: ${resolveRoute()}`,
+		`api route: ${ROUTE_LABELS[resolveRoute()]}`,
 		"",
 		"flags:",
 		...flagLines,
 		"",
 		"toggle: /glm-tweaks toggle <flag>   (shorthand: /glm-tweaks <flag>)",
-		"route:  /glm-tweaks route <coding|anthropic>",
+		"route:  /glm-tweaks route <coding|api|anthropic>",
 	].join("\n");
 }
 
@@ -369,9 +387,20 @@ export default function (pi: ExtensionAPI) {
 			const trailingSpace = /\s$/.test(prefix);
 			const tokens = prefix.trim().split(/\s+/).filter(Boolean);
 			const flagNames = FLAGS.map((f) => f.name);
-			const root = ["toggle", ...flagNames];
+			const root = ["route", "toggle", ...flagNames];
 			// Suggest flag names once `toggle` is complete (either as the only
 			// token with a trailing space, or with a partial flag typed).
+			// `/glm-tweaks route ` (trailing space) or a partial value:
+			// suggest the human-readable labels plus the short keys.
+			const routeComplete =
+				(tokens.length === 1 && tokens[0] === "route") ||
+				(tokens.length >= 2 && tokens[0] === "route");
+			if (routeComplete) {
+				const partial = tokens.length >= 2 ? tokens[tokens.length - 1] : "";
+				const opts = [...ROUTE_VALUES.map((r) => ROUTE_LABELS[r]), ...ROUTE_VALUES];
+				const hits = opts.filter((o) => o.toLowerCase().startsWith(partial.toLowerCase()));
+				return hits.length ? hits.map((v) => ({ value: v, label: v })) : null;
+			}
 			const toggleComplete =
 				(tokens.length === 1 && tokens[0] === "toggle") ||
 				(tokens.length >= 2 && tokens[0] === "toggle");
@@ -389,21 +418,29 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 
-			// Route mode: `/glm-tweaks route <coding|anthropic>`. Persists the
-			// enum setting and reloads so session_start re-registers the
-			// provider against the new endpoint. Same apply path as flags.
-			const routeMatch = /^route\s+(\S+)$/.exec(trimmed);
+			// Route mode: `/glm-tweaks route <x>`. Accepts the short key
+			// (coding | api | anthropic) or the full label
+			// ("openai (coding plan)" | "openai (api usage)" | "anthropic").
+			// Persists the canonical key and reloads so session_start
+			// re-registers the provider against the new endpoint.
+			const routeMatch = /^route\s+(.+)$/.exec(trimmed);
 			if (routeMatch) {
-				const value = routeMatch[1] as ApiRoute;
-				if (!ROUTE_VALUES.includes(value)) {
-					ctx.ui.notify(`Unknown route "${value}". Valid: ${ROUTE_VALUES.join(" | ")}`, "warning");
+				const raw = routeMatch[1].trim().toLowerCase();
+				const byKey = ROUTE_VALUES.find((r) => r === raw);
+				const byLabel = ROUTE_VALUES.find((r) => ROUTE_LABELS[r] === raw);
+				const route = byKey ?? byLabel;
+				if (route === undefined) {
+					ctx.ui.notify(
+						`Unknown route "${routeMatch[1]}". Valid: ${ROUTE_VALUES.map((r) => `${r} (${ROUTE_LABELS[r]})`).join(" | ")}`,
+						"warning",
+					);
 					return;
 				}
-				if (!saveSetting(ROUTE_SETTING, value)) {
+				if (!saveSetting(ROUTE_SETTING, route)) {
 					ctx.ui.notify(`Failed to persist ${ROUTE_SETTING} to settings file.`, "error");
 					return;
 				}
-				ctx.ui.notify(`api route → ${value}. Reloading...`, "info");
+				ctx.ui.notify(`api route → ${ROUTE_LABELS[route]}. Reloading...`, "info");
 				await ctx.reload();
 				return;
 			}
@@ -451,9 +488,9 @@ export default function (pi: ExtensionAPI) {
 					id: ROUTE_SETTING,
 					label: "API route",
 					description:
-						"z.ai endpoint for targeted GLM models. coding: OpenAI Chat Completions at api.z.ai/api/coding/paas/v4 (implicit prefix caching, documented thinking contract). anthropic: Anthropic Messages at api.z.ai/api/anthropic (cache_control breakpoints, cache reads visible in usage; cache-write is not itemized by z.ai so it shows 0). Same Coding Plan credits either way. Switching mid-conversation replays prior turns' reasoning as plain text.",
-					currentValue: resolveRoute(),
-					values: ROUTE_VALUES,
+						"z.ai endpoint for targeted GLM models. openai (coding plan): OpenAI Chat Completions at api.z.ai/api/coding/paas/v4, billed in Coding Plan credits; Preserved Thinking on by default. openai (api usage): OpenAI Chat Completions at api.z.ai/api/paas/v4, billed per token against a standard z.ai API key (Coding Plan keys are not interchangeable with standard keys). anthropic: Anthropic Messages at api.z.ai/api/anthropic, Coding Plan credits (cache_control breakpoints, cache reads visible in usage; cache-write is not itemized by z.ai so it shows 0). Switching mid-conversation replays prior turns' reasoning as plain text.",
+					currentValue: ROUTE_LABELS[resolveRoute()],
+					values: ROUTE_VALUES.map((r) => ROUTE_LABELS[r]),
 				},
 				...FLAGS.map((f) => ({
 					id: f.name,
@@ -500,11 +537,17 @@ export default function (pi: ExtensionAPI) {
 			// staleness trigger, and we haven't called it yet). Drop net-zero
 			// flips (a flag toggled on then off stages but changes nothing),
 			// then persist genuine deltas and reload once if any moved.
+			// The route item stages its display LABEL; normalize to the
+			// canonical key before comparing/persisting so the settings
+			// file keeps the short, stable form.
+			const routeKeyFor = (v: string): string =>
+				ROUTE_VALUES.find((r) => ROUTE_LABELS[r] === v) ?? (ROUTE_VALUES.includes(v as ApiRoute) ? v : "coding");
 			const deltas: Array<[string, boolean | string]> = [];
 			for (const [name, val] of pending) {
 				const current: boolean | string = name === ROUTE_SETTING ? resolveRoute() : pi.getFlag(name) === true;
-				if (current === val) continue; // net-zero: changed back to current
-				deltas.push([name, val]);
+				const next: boolean | string = name === ROUTE_SETTING ? routeKeyFor(String(val)) : val;
+				if (current === next) continue; // net-zero: changed back to current
+				deltas.push([name, next]);
 			}
 			if (deltas.length === 0) return;
 

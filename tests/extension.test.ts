@@ -168,7 +168,7 @@ describe("pi-glm-tweaks extension entry", () => {
 
 		handlers.model_select({ model: { provider: "zai", id: "glm-5.3" } }, ctx);
 
-		// xhigh was the pre-1.4.1 label for wire "max": the clamp must land on
+		// xhigh was the pre-1.5.0 label for wire "max": the clamp must land on
 		// max (same wire effort) instead of silently halving to high.
 		expect(set).toEqual(["max"]);
 		expect(notes[0]).toContain('Switched to max');
@@ -244,6 +244,40 @@ describe("glm-api-route setting", () => {
 		expect(glm53.compat.zaiToolStream).toBe(true);
 	});
 
+	it("api route (standard z.ai platform API) registers against api.z.ai/api/paas/v4 with the OpenAI shape", async () => {
+		withRouteSetting("api");
+		const { pi, handlers, state, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+		await factory(pi as unknown as TestPi);
+		await handlers.session_start(undefined, ctx);
+
+		const models = (state.registered!.def as { models: Array<Record<string, unknown>> }).models;
+		const glm53 = models.find((m) => m.id === "glm-5.3") as Record<string, any>;
+		expect(glm53.api).toBe("openai-completions");
+		expect(glm53.baseUrl).toBe("https://api.z.ai/api/paas/v4");
+		// Same thinking contract as the coding route: only billing differs.
+		expect(glm53.compat.thinkingFormat).toBe("zai");
+	});
+
+	it("legacy and unknown persisted route values resolve safely", async () => {
+		// "coding" is the pre-1.5.0 persisted form and the fallback for
+		// unset/garbage; "anthropic" is the other pre-1.5.0 form. Garbage
+		// must fall back to coding, never throw or miswire the base URL.
+		const cases: Array<[string, string]> = [
+			["coding", "https://api.z.ai/api/coding/paas/v4"],
+			["anthropic", "https://api.z.ai/api/anthropic"],
+			["legacy-v1", "https://api.z.ai/api/coding/paas/v4"],
+		];
+		for (const [persisted, expectedBaseUrl] of cases) {
+			withRouteSetting(persisted);
+			const { pi, handlers, state, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
+			await factory(pi as unknown as TestPi);
+			await handlers.session_start(undefined, ctx);
+			const models = (state.registered!.def as { models: Array<Record<string, unknown>> }).models;
+			const glm53 = models.find((m) => m.id === "glm-5.3") as Record<string, any>;
+			expect(glm53.baseUrl).toBe(expectedBaseUrl);
+		}
+	});
+
 	it("anthropic route replaces Pi's budget-based thinking with enabled+reasoning_effort", async () => {
 		withRouteSetting("anthropic");
 		const { pi, handlers, ctx } = makePi([{ provider: "zai", id: "glm-5.3" }]);
@@ -279,7 +313,7 @@ describe("glm-api-route setting", () => {
 	});
 
 	it("anthropic route falls back to the lightest DOCUMENTED effort per spec (glm-5.2 off → high, not low)", async () => {
-		// Peer-review finding (v1.4.1): glm-5.2's map has no "off" key, so an
+		// Peer-review finding (v1.5.0): glm-5.2's map has no "off" key, so an
 		// unmapped level hit the hardcoded "low" fallback — an effort glm-5.2
 		// does not document (its wire tiers are high|max). The fallback must
 		// be spec-aware: 5.2 → high, 5.3 → low.

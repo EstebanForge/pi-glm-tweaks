@@ -1,6 +1,24 @@
 # Changelog
 
-## 1.4.1 — 2026-08-21
+## 1.5.0 — 2026-08-21
+
+### Added
+- **`openai (api usage)` route: the standard z.ai platform API** at
+  `https://api.z.ai/api/paas/v4` (per-token billing). The route setting now
+  offers three labeled options — `openai (coding plan)` (default, Coding
+  Plan credits), `openai (api usage)` (standard API, per token), and
+  `anthropic` — instead of the bare `coding` / `anthropic` pair. The
+  settings menu, `/glm-tweaks` status panel, and tab-completions show the
+  labels; the persisted value keeps the short keys (`coding` | `api` |
+  `anthropic`) so pre-existing settings files load unchanged.
+  - Same OpenAI Chat Completions thinking contract as the coding route
+    (`thinking.type` + `reasoning_effort` + `clear_thinking: false` +
+    verbatim `reasoning_content` replay); only the endpoint and who bills
+    you differ. Preserved Thinking defaults OFF server-side on the standard
+    API, but the explicit `clear_thinking: false` enables it, so the cache
+    posture matches the coding route.
+  - **Key caveat**: z.ai keys are not interchangeable — the api route needs
+    a standard platform API key, not the Coding Plan key.
 
 ### Changed
 - **`glm-budget-nudge` now defaults OFF** (user request): cache-neutral is
