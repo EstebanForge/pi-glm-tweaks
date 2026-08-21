@@ -1,5 +1,89 @@
 # Changelog
 
+## 1.6.0 — 2026-08-21
+
+### Added
+- **`zai_web_search` tool: live web search through Z.AI's Web Search MCP
+  endpoint, with no MCP server required.** Z.AI exposes Coding Plan web
+  search as a remote streamable-HTTP MCP server
+  (`api.z.ai/api/mcp/web_search_prime/mcp`, tool `web_search_prime`;
+  [docs](https://docs.z.ai/devpack/mcp/search-mcp-server)) that clients
+  normally wire through an MCP configuration. The extension now speaks the
+  MCP JSON-RPC protocol directly over `fetch` (`lib/zai-search.ts`), so the
+  tool ships inside pi with zero MCP setup and searches bill against the
+  GLM Coding Plan search quota, same as the official MCP path.
+  - Protocol details probed live and encoded in the client: initialize →
+    `notifications/initialized` → `tools/call`; responses are SSE-framed
+    JSON-RPC (plain JSON bodies also accepted — both are parsed); the
+    session id rides the `mcp-session-id` response header; the server's SSE
+    `id:` line can disagree with the JSON-RPC body id, so messages are
+    matched on the body; negotiated protocol version (2024-11-05) is echoed
+    back via `MCP-Protocol-Version`; the result `content[0].text` is
+    DOUBLE-encoded JSON (a JSON string wrapping the JSON array of results)
+    and both layers are unwrapped.
+  - The MCP session is cached for the process lifetime; concurrent first
+    calls dedupe through a shared handshake promise; on session loss (HTTP
+    404/410, 400/JSON-RPC errors mentioning the session) the client drops
+    the cached id, re-initializes once, and retries. Non-session errors
+    propagate without a retry.
+  - Key reuse: the tool resolves the same key as the provider (pi auth
+    storage: `/login`, `models.json` apiKey, `ZAI_API_KEY`), with a raw
+    env-var fallback so it works even without a `zai` provider configured.
+    A missing key fails the call visibly with the opt-out hint instead of
+    returning a fake empty result set.
+  - Parameters map 1:1 to the server schema (which is
+    `additionalProperties: false`): `query` → `search_query`, `recency` →
+    `search_recency_filter` (`oneDay|oneWeek|oneMonth|oneYear|noLimit`),
+    `domain` → `search_domain_filter`, `contentSize` → `content_size`
+    (`medium|high`), `location` (`cn|us`). Undefined optionals are dropped.
+    45s hard timeout per call (combined with pi's cancellation signal via
+    `AbortSignal.any`). ~10 results per search.
+  - **New flag `glm-web-search` (default ON, user request):** registers the
+    tool out of the box; users running a different search provider opt out
+    with `/glm-tweaks glm-web-search` and the tool disappears after the
+    reload. The flag joined the single-source-of-truth `FLAGS` list, so it
+    surfaces in `pi config`, the `/glm-tweaks` menu/status/autocomplete for
+    free.
+- `@earendil-works/pi-ai` and `typebox` declared as optional peer
+  dependencies (pinned as devDependencies for typecheck; pi provides both
+  at runtime), matching the pattern already used by pi-ask-* and pi-git-me.
+- Tests: MCP client protocol suite with a fake fetch (SSE/JSON parsing,
+  id matching, double-decode, session reuse across calls, header
+  propagation, 404 and JSON-RPC session-loss retry, non-session error
+  propagation, isError surface, initialize failure) plus tool gating
+  (registered by default, absent when opted out) and the no-key visible
+  failure.
+
+### Verified
+- Live end-to-end through the shipped client code: first search 9 results
+  in ~2.8s (includes handshake), second search 10 results in ~1.7s
+  (cached session, no re-initialize). Re-verified after the peer-review
+  fixes below.
+
+### Notes
+- **Peer-reviewed** (Claude Sonnet, read-only): three findings, all fixed.
+  - Handshake failures (bad key, endpoint down) were misclassified as
+    session errors — the error messages embed the word "initialize", which
+    the retry matcher keyed on — so a permanent auth failure burned a
+    doubled handshake (4 POSTs instead of 2). The matcher now keys on
+    "session" only; a failed handshake is never retryable.
+  - The session-reset retry path raced under concurrent calls: N parallel
+    searches on a dead session could each reset + re-handshake, and one
+    call could tear down a sibling's fresh session. The reset is now
+    compare-and-clear against the handshake generation the failing call
+    ran on: exactly one caller refreshes, siblings reuse the new session.
+  - Result items were validated on `link` only; an item with a link but
+    missing `title`/`content` survived the filter and crashed the formatter
+    with a raw TypeError. All three fields are now validated (malformed
+    items are dropped, and a fully-malformed payload still fails visibly).
+  - New regression tests pin all three: bad key → exactly one handshake
+    and zero tool calls; two concurrent searches on a dead session →
+    exactly 2 handshakes and 4 tool calls total; malformed-item filtering.
+  - Comment fixes: client lifetime is per factory load (/reload discards
+    it; sessions are intentionally not torn down — server-side TTL reaps),
+    and the requested-vs-negotiated protocol version is documented at the
+    constant.
+
 ## 1.5.0 — 2026-08-21
 
 ### Added

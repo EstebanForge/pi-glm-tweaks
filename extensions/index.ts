@@ -6,7 +6,10 @@
  * supports, wires the native `thinkingFormat: "zai"` wire
  * translation, auto-clamps hidden levels, and applies token-efficiency
  * hygiene (per-turn system-prompt nudge, wire-level
- * clear_thinking and skip-short-thinking).
+ * clear_thinking and skip-short-thinking), and registers a direct
+ * zai_web_search tool that speaks Z.AI's remote Web Search MCP
+ * endpoint over plain HTTPS — no MCP server setup needed (glm-web-search
+ * flag, default ON).
  *
  * Wire map (see https://docs.z.ai/guides/capabilities/thinking and
  * providers/openai-completions.js in pi-ai):
@@ -68,8 +71,11 @@
  * or models.json apiKey) continues to resolve against the new baseUrl.
  */
 import { getSettingsListTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { loadFlagSettings, loadStringSettings, saveSetting } from "../lib/flag-settings";
+import { ZaiMcpSearchClient, type ZaiSearchResult, type ZaiWebSearchArgs } from "../lib/zai-search";
 
 const PROVIDER = "zai";
 const ZAI_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
@@ -222,15 +228,20 @@ function lightestEffort(spec: GlmSpec): string {
 // would be over-engineering for a single-model extension.
 const SHORT_PROMPT_THRESHOLD = 80;
 
-// Token-efficiency flags. Single source of truth — drives registerFlag,
-// the /glm-tweaks status display, autocomplete, and the toggle subcommand.
-// All three default OFF since 1.5.0: glm-budget-nudge is cache-safe (it
-// appends a fixed fragment, so the prefix stays byte-identical turn to
+// Extension flags. Single source of truth — drives registerTool gating
+// (glm-web-search), registerFlag, the /glm-tweaks status display,
+// autocomplete, and the toggle subcommand. The three glm-*-thinking flags
+// are token-efficiency tweaks; glm-web-search is a feature toggle.
+// The thinking flags default OFF since 1.5.0: glm-budget-nudge is cache-safe
+// (it appends a fixed fragment, so the prefix stays byte-identical turn to
 // turn and the z.ai server cache is reused) but NOT behavior-neutral — it
 // rewrites the system prompt for every GLM turn; glm-clear-thinking and
 // glm-skip-short-thinking additionally undermine the coding endpoint's
 // Preserved Thinking caching (see docs.z.ai/guides/capabilities/thinking-
-// mode). Users who want any of them opt in via /glm-tweaks.
+// mode). Users who want any of them opt in via /glm-tweaks. glm-web-search
+// defaults ON: a working search tool out of the box is the point of the
+// feature, and opting out is one toggle (users who run a different search
+// provider turn it off so the model does not see two competing tools).
 const FLAGS = [
 	{
 		name: "glm-budget-nudge",
@@ -252,6 +263,13 @@ const FLAGS = [
 		default: false,
 		description:
 			"For user prompts under 80 chars, use the lightest thinking mode for that turn: glm-5.2 gets thinking.type=disabled; glm-5.3 gets thinking.type=enabled + reasoning_effort=low (5.3 rejects \"disabled\"). Cache: toggles thinking intensity across turns based on prompt length, which changes the reasoning_content sequence z.ai caches; follow-up turns on the same session re-bill instead of hitting the cached prefix.",
+	},
+	{
+		name: "glm-web-search",
+		label: "Z.AI web search",
+		default: true,
+		description:
+			"Register the zai_web_search tool: live web search through Z.AI's remote Web Search MCP server (web_search_prime), billed against the GLM Coding Plan search quota. The extension speaks the MCP protocol directly over HTTPS, so no MCP server setup is needed — the configured Z.AI key (ZAI_API_KEY env, /login, or models.json apiKey) is reused. Default ON so the tool works out of the box; turn it OFF if you prefer another search provider (the tool disappears after the reload).",
 	},
 ] as const;
 
@@ -348,6 +366,56 @@ function renderStatus(
 	].join("\n");
 }
 
+/**
+ * Render search results for the LLM: numbered title + URL + flattened
+ * summary. `refer` (Z.AI's internal citation id) is dropped — it carries
+ * no information the model can act on.
+ */
+function formatSearchResults(query: string, results: ZaiSearchResult[]): string {
+	if (results.length === 0) return `No web results for "${query}".`;
+	const lines = results.map(
+		(r, i) => `${i + 1}. ${r.title}\n   ${r.link}\n   ${r.content.replace(/\s+/g, " ").trim()}`,
+	);
+	return `Web results for "${query}":\n\n${lines.join("\n\n")}`;
+}
+
+// zai_web_search timeout. Searches take a few seconds; 45s covers the slow
+// tail (contentSize=high) while still failing visibly on a hung connection
+// instead of blocking the agent loop forever.
+const SEARCH_TIMEOUT_MS = 45_000;
+
+/** Combine the tool's cancellation signal with a hard timeout. */
+function withSearchTimeout(signal: AbortSignal | undefined): AbortSignal {
+	const timeout = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+/**
+ * Resolve the Z.AI API key for the search tool. Prefers pi's auth storage
+ * (same resolution as the provider: /login, models.json apiKey, or the
+ * ZAI_API_KEY env var it reads), then falls back to the raw env var for
+ * installs with no zai provider configured at all (the tool is usable
+ * with any model, not just GLM). Throws with the opt-out hint when no key
+ * exists anywhere — a missing key must fail the call visibly, not return
+ * an empty result set.
+ */
+async function resolveZaiApiKey(ctx: {
+	modelRegistry: { getApiKeyForProvider: (provider: string) => Promise<string | undefined> };
+}): Promise<string> {
+	try {
+		const key = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
+		if (key) return key;
+	} catch {
+		// Provider not configured (no zai entry in the registry) — fall
+		// through to the env var.
+	}
+	const envKey = process.env.ZAI_API_KEY;
+	if (envKey) return envKey;
+	throw new Error(
+		"zai_web_search: no Z.AI API key found. Configure zai auth (/login, ZAI_API_KEY, or models.json apiKey), or turn the tool off with /glm-tweaks glm-web-search.",
+	);
+}
+
 export default function (pi: ExtensionAPI) {
 	// Register Pi-idiomatic flags at factory load time, NOT inside
 	// session_start. registerFlag is static setup; calling it per session
@@ -369,6 +437,82 @@ export default function (pi: ExtensionAPI) {
 			description: f.description,
 			type: "boolean",
 			default: f.name in persisted ? persisted[f.name] : f.default,
+		});
+	}
+
+	// ── zai_web_search tool ─────────────────────────────────────────────
+	// Z.AI ships Coding Plan web search as a REMOTE MCP server
+	// (api.z.ai/api/mcp/web_search_prime/mcp, tool web_search_prime).
+	// Instead of requiring an MCP client setup, we speak the MCP
+	// JSON-RPC protocol directly over fetch (lib/zai-search.ts): initialize
+	// handshake once per process, then one tools/call per search. Searches
+	// bill against the GLM Coding Plan search quota, same as the official
+	// MCP path. Gated by glm-web-search (default ON) so users on another
+	// search provider can opt out; the gate is evaluated at factory load,
+	// and the /glm-tweaks toggle reloads the factory, so the tool appears
+	// and disappears on the next turn without a pi restart.
+	// registerTool at factory load is supported (pi docs: "works both during
+	// extension load and after startup") and the tool is refreshed in the
+	// active session immediately.
+	if (pi.getFlag("glm-web-search") !== false) {
+		// One client per FACTORY LOAD: the MCP session survives across calls
+		// within it. /reload re-runs the factory in the same process, which
+		// discards the old client without an MCP session teardown — sessions
+		// are intentionally not closed (neither here nor on session_shutdown):
+		// the server-side TTL reaps them, and a DELETE on every reload would
+		// add a round-trip to a code path that must stay fast.
+		const searchClient = new ZaiMcpSearchClient();
+
+		pi.registerTool({
+			name: "zai_web_search",
+			label: "Z.AI Web Search",
+			description:
+				"Search the live web via Z.AI (web_search_prime). Returns ~10 results: page title, URL, and a content summary. Params: query (keep under ~70 chars); recency (oneDay|oneWeek|oneMonth|oneYear|noLimit, default noLimit); domain (restrict to one domain, e.g. docs.z.ai); contentSize (medium ~400-600 words/result, high ~2500); location (cn|us result region). Uses the GLM Coding Plan search quota.",
+			promptSnippet: "Search the live web via Z.AI (zai_web_search)",
+			promptGuidelines: [
+				"Use zai_web_search for live web lookups (current events, library docs, facts you cannot verify locally). One focused query per topic; refine only if the results miss.",
+			],
+			parameters: Type.Object({
+				query: Type.String({ description: "Search query. Keep under ~70 characters for best results." }),
+				recency: Type.Optional(
+					StringEnum(["oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"] as const, {
+						description: "Time range of results. noLimit is the default.",
+					}),
+				),
+				domain: Type.Optional(
+					Type.String({ description: "Restrict results to one domain, e.g. docs.z.ai or github.com." }),
+				),
+				contentSize: Type.Optional(
+					StringEnum(["medium", "high"] as const, {
+						description: "Summary length per result: medium (~400-600 words, default) or high (~2500 words, higher quota cost).",
+					}),
+				),
+				location: Type.Optional(
+					StringEnum(["cn", "us"] as const, {
+						description: "Result region: cn (Chinese, server default) or us (non-Chinese).",
+					}),
+				),
+			}),
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				const apiKey = await resolveZaiApiKey(ctx);
+				// Wire arguments: only defined optionals are sent — the server
+				// schema is additionalProperties:false, but empty strings would
+				// also change server behavior (e.g. an empty domain filter).
+				const args: ZaiWebSearchArgs = { search_query: params.query };
+				if (params.recency) args.search_recency_filter = params.recency;
+				if (params.domain) args.search_domain_filter = params.domain;
+				if (params.contentSize) args.content_size = params.contentSize;
+				if (params.location) args.location = params.location;
+
+				const results = await searchClient.search(args, {
+					apiKey,
+					signal: withSearchTimeout(signal),
+				});
+				return {
+					content: [{ type: "text", text: formatSearchResults(params.query, results) }],
+					details: { query: params.query, count: results.length, links: results.map((r) => r.link) },
+				};
+			},
 		});
 	}
 

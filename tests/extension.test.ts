@@ -11,7 +11,8 @@ interface TestPi {
 	registerFlag: (name: string, def: unknown) => void;
 	on: (name: string, handler: SessionStartHandler) => void;
 	registerProvider: (provider: string, def: unknown) => void;
-	getFlag: () => undefined;
+	registerTool: (tool: unknown) => void;
+	getFlag: (name: string) => boolean | undefined;
 }
 
 function makePi(models: Array<{ provider: string; id: string }>) {
@@ -19,13 +20,15 @@ function makePi(models: Array<{ provider: string; id: string }>) {
 	const handlers: Record<string, SessionStartHandler> = {};
 
 	const state = { registered: undefined as { provider: string; def: unknown } | undefined };
+	const tools: unknown[] = [];
 
 	const pi = {
 		registerCommand: (name: string) => void commands.push(name),
 		registerFlag: () => {},
 		on: (name: string, handler: SessionStartHandler) => void (handlers[name] = handler),
 		registerProvider: (provider: string, def: unknown) => void (state.registered = { provider, def }),
-		getFlag: () => undefined,
+		registerTool: (tool: unknown) => void tools.push(tool),
+		getFlag: (_name: string) => undefined as boolean | undefined,
 	};
 
 	const ctx = {
@@ -37,7 +40,7 @@ function makePi(models: Array<{ provider: string; id: string }>) {
 		ui: { notify: () => {}, setStatus: () => {} },
 	};
 
-	return { pi, commands, handlers, state, ctx };
+	return { pi, commands, handlers, state, tools, ctx };
 }
 
 describe("pi-glm-tweaks extension entry", () => {
@@ -172,6 +175,48 @@ describe("pi-glm-tweaks extension entry", () => {
 		// max (same wire effort) instead of silently halving to high.
 		expect(set).toEqual(["max"]);
 		expect(notes[0]).toContain('Switched to max');
+	});
+});
+
+describe("zai_web_search tool registration", () => {
+	const toolName = (t: unknown) => (t as { name: string }).name;
+
+	it("registers the tool by default (undefined flag = default ON)", async () => {
+		const { pi, tools } = makePi([]);
+		await factory(pi as unknown as TestPi);
+		expect(tools.map(toolName)).toContain("zai_web_search");
+	});
+
+	it("does not register the tool when glm-web-search is opted out", async () => {
+		const { pi, tools } = makePi([]);
+		const optedOut = { ...pi, getFlag: (name: string) => (name === "glm-web-search" ? false : undefined) };
+		await factory(optedOut as unknown as TestPi);
+		expect(tools.map(toolName)).not.toContain("zai_web_search");
+	});
+
+	it("fails visibly with the opt-out hint when no Z.AI key exists anywhere", async () => {
+		const { pi, tools, ctx } = makePi([]);
+		await factory(pi as unknown as TestPi);
+		const tool = tools.find((t) => toolName(t) === "zai_web_search") as {
+			execute: (id: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
+		};
+
+		// No provider key in the registry and no env var: execute must throw
+		// (an empty result set would silently look like "no results found").
+		// The makePi stub returns "test-key" — neutralize it so nothing
+		// resolves and the tool must fail BEFORE any network traffic.
+		(ctx as { modelRegistry: { getApiKeyForProvider: () => Promise<string | undefined> } }).modelRegistry = {
+			getApiKeyForProvider: async () => undefined,
+		};
+		const hadEnv = process.env.ZAI_API_KEY;
+		delete process.env.ZAI_API_KEY;
+		try {
+			await expect(tool.execute("t1", { query: "anything" }, undefined, undefined, ctx)).rejects.toThrow(
+				/no Z\.AI API key.*glm-tweaks glm-web-search/s,
+			);
+		} finally {
+			if (hadEnv !== undefined) process.env.ZAI_API_KEY = hadEnv;
+		}
 	});
 });
 

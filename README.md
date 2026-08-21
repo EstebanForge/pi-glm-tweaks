@@ -1,6 +1,6 @@
 # @estebanforge/pi-glm-tweaks
 
-Pi-native tweaks for Z.AI's **GLM coding models** — `glm-5.2`, `glm-5.3`, and the 1M-context `glm-5.3[1m]` Coding Plan route. Restricts the Pi thinking-level UI to the modes each model actually supports on the wire, wires the native `thinkingFormat:"zai"` translation, and auto-clamps any stale level when the model is selected.
+Pi-native tweaks for Z.AI's **GLM coding models** — `glm-5.2`, `glm-5.3`, and the 1M-context `glm-5.3[1m]` Coding Plan route. Restricts the Pi thinking-level UI to the modes each model actually supports on the wire, wires the native `thinkingFormat:"zai"` translation, auto-clamps any stale level when the model is selected, and registers a `zai_web_search` tool that searches the live web through Z.AI's Web Search MCP endpoint — no MCP server setup needed.
 
 ## Install
 
@@ -75,6 +75,7 @@ GLM-5.2 overthinks on long agent loops — it can spend an entire turn on `reaso
 
 | Flag | Default | What it does |
 | --- | --- | --- |
+| `glm-web-search` | `true` | Registers the `zai_web_search` tool (see [Z.AI web search tool](#zai-web-search-tool-zai_web_search)). Default ON so search works out of the box; turn it OFF if you run a different search provider, so the model does not see two competing search tools. |
 | `glm-budget-nudge` | `false` | Appends a constant thinking-budget fragment to the system prompt on every targeted zai GLM turn, steering the model toward committing to a tool call before it spirals into overthinking. Meant for GLM-5.2's overthinking loop; not recommended for GLM-5.3+, whose post-training already fixed it. **Cache:** safe — the fragment is a fixed string, so the appended system prompt stays byte-identical turn to turn and the cached prefix is reused. (The earlier mid-loop ratchet appended a reactive `[system reminder: ...]` message after the last tool result; that hint sat between the cached prefix and the model's next turn, displacing it from the cache and forcing a one-time re-ingest. It fired when reasoning was largest, so it is gone.) |
 | `glm-clear-thinking` | `false` | Forces `clear_thinking: true` on every request, opting out of z.ai Preserved Thinking. Preserved Thinking is the coding endpoint's default and is what keeps the prefix byte-stable across turns (so it caches). Disabling it re-bills the full prefix every turn — usually a net loss. |
 | `glm-skip-short-thinking` | `false` | For user prompts under 80 chars, uses the lightest thinking mode for that turn: `thinking.type: "disabled"` on 5.2, `thinking.type: "enabled"` + `reasoning_effort: "low"` on 5.3 (which rejects `disabled`). **Cache:** toggling thinking intensity across turns based on prompt length changes the reasoning_content sequence z.ai caches, so follow-up turns on the same session re-bill instead of hitting the cached prefix. |
@@ -104,6 +105,24 @@ The command offers tab-completion for `toggle` and the three flag names.
 - Force the model to call a tool. The system prompt can ask; nothing forces it.
 - Lower `reasoning_effort` per-request. Per [KiwiGaze/glm-for-copilot #7](https://github.com/KiwiGaze/glm-for-copilot/issues/7) it's a no-op on `/chat/completions`.
 
+## Z.AI web search tool (`zai_web_search`)
+
+Z.AI ships Coding Plan web search as a remote MCP server ([docs](https://docs.z.ai/devpack/mcp/search-mcp-server)) that clients normally wire up through an MCP configuration. This extension speaks the MCP JSON-RPC protocol to that endpoint directly over HTTPS (`lib/zai-search.ts`), so the `zai_web_search` tool works with zero MCP setup: initialize handshake once per process, then one `tools/call` per search. The MCP session is cached and re-established automatically if the server evicts it; results bill against the GLM Coding Plan search quota, exactly like the official MCP path.
+
+The tool uses the already-configured Z.AI key (same resolution as the provider: `/login`, `models.json` apiKey, or `ZAI_API_KEY`), works with any model — not just GLM — and fails visibly with the opt-out hint when no key exists. Each search has a 45s timeout. Searches return ~10 results (page title, URL, content summary).
+
+Parameters (mapped to the server's `web_search_prime` schema):
+
+| Parameter | Wire field | Values |
+| --- | --- | --- |
+| `query` | `search_query` | free text; keep under ~70 chars for best results |
+| `recency` | `search_recency_filter` | `oneDay` `oneWeek` `oneMonth` `oneYear` `noLimit` (default `noLimit`) |
+| `domain` | `search_domain_filter` | one domain, e.g. `docs.z.ai` |
+| `contentSize` | `content_size` | `medium` (~400-600 words/result, default) or `high` (~2500 words, higher quota cost) |
+| `location` | `location` | `cn` (server default) or `us` |
+
+Toggle with `/glm-tweaks glm-web-search` (default ON; a reload applies it, and the tool appears/disappears on the next turn). Wire-level details were probed live and are documented in the code: SSE-framed JSON-RPC responses (plain JSON also accepted), session id in the `mcp-session-id` response header, double-encoded result text, and an SSE `id:` line that can disagree with the JSON-RPC body id (the parser matches on the body).
+
 ## API route selection
 
 Three z.ai endpoints, two billing worlds ([docs](https://docs.z.ai/devpack/quick-start), [thinking mode](https://docs.z.ai/guides/capabilities/thinking-mode)):
@@ -127,7 +146,7 @@ Pi's built-in `thinkingFormat: "zai"` (in `openai-completions.js`) already knows
 
 ## Compatibility
 
-- Pi (`@earendil-works/pi-coding-agent`) — any version with `registerProvider` taking effect post-bind and `thinkingFormat: "zai"` support, plus the `before_agent_start` / `context` / `before_provider_request` / `registerFlag` hooks.
+- Pi (`@earendil-works/pi-coding-agent`) — any version with `registerProvider` taking effect post-bind and `thinkingFormat: "zai"` support, plus the `before_agent_start` / `context` / `before_provider_request` / `registerFlag` / `registerTool` hooks.
 - Z.AI API key — resolved through Pi's standard auth storage (env var `ZAI_API_KEY`, `/login`, or `models.json` provider `apiKey`). The extension does not configure auth.
 
 ## License
